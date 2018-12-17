@@ -221,6 +221,8 @@ object StdNames {
     final val AnnotationDefaultATTR: N      = "AnnotationDefault"
     final val BridgeATTR: N                 = "Bridge"
     final val ClassfileAnnotationATTR: N    = "RuntimeInvisibleAnnotations" // RetentionPolicy.CLASS. Currently not used (Apr 2009).
+    final val ClassfileParamAnnotationATTR: N = "RuntimeInvisibleParameterAnnotations" // RetentionPolicy.CLASS (annotations on parameters)
+    final val ClassfileTypeAnnotationATTR: N = "RuntimeInvisibleTypeAnnotations" // RetentionPolicy.CLASS (annotations on types)
     final val CodeATTR: N                   = "Code"
     final val ConstantValueATTR: N          = "ConstantValue"
     final val DeprecatedATTR: N             = "Deprecated"
@@ -230,6 +232,7 @@ object StdNames {
     final val LocalVariableTableATTR: N     = "LocalVariableTable"
     final val RuntimeAnnotationATTR: N      = "RuntimeVisibleAnnotations"   // RetentionPolicy.RUNTIME
     final val RuntimeParamAnnotationATTR: N = "RuntimeVisibleParameterAnnotations" // RetentionPolicy.RUNTIME (annotations on parameters)
+    final val RuntimeTypeAnnotationATTR: N  = "RuntimeVisibleTypeAnnotations" // RetentionPolicy.RUNTIME (annotations on types)
     final val ScalaATTR: N                  = "Scala"
     final val ScalaSignatureATTR: N         = "ScalaSig"
     final val TASTYATTR: N                  = "TASTY"
