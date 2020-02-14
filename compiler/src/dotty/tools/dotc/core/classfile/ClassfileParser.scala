@@ -409,16 +409,22 @@ class ClassfileParser(
     def sig2type(tparams: immutable.Map[Name, Symbol], skiptvs: Boolean, annotPath: AnnotationPath)(implicit ctx: Context): Type = {
       val tag = sig(index); index += 1
       val tp = (tag: @switch) match {
-        case BYTE_TAG => defn.ByteType
-        case CHAR_TAG => defn.CharType
+        case BYTE_TAG   => defn.ByteType
+        case CHAR_TAG   => defn.CharType
         case DOUBLE_TAG => defn.DoubleType
-        case FLOAT_TAG => defn.FloatType
-        case INT_TAG => defn.IntType
-        case LONG_TAG => defn.LongType
-        case SHORT_TAG => defn.ShortType
-        case VOID_TAG => defn.UnitType
-        case BOOL_TAG => defn.BooleanType
+        case FLOAT_TAG  => defn.FloatType
+        case INT_TAG    => defn.IntType
+        case LONG_TAG   => defn.LongType
+        case SHORT_TAG  => defn.ShortType
+        case VOID_TAG   => defn.UnitType
+        case BOOL_TAG   => defn.BooleanType
         case 'L' =>
+          def processInner(tp: Type): Type = tp match {
+            case tp: TypeRef if !tp.symbol.owner.is(Flags.ModuleClass) =>
+              TypeRef(processInner(tp.prefix.widen), tp.symbol.asType)
+            case _ =>
+              tp
+          }
           def processClassType(tp: Type, annotPath: AnnotationPath): Type = {
             val applied = tp match {
               case tp: TypeRef =>
@@ -465,7 +471,7 @@ class ClassfileParser(
           }
           val classSym = classNameToSymbol(subName(c => c == ';' || c == '<'))
           var (tpe, classAnnotPath) = typeRefWithAnnotsOnPrefix(classSym, typeAnnots, annotPath)
-          tpe = processClassType(tpe, classAnnotPath)
+          tpe = processClassType(processInner(tpe), classAnnotPath)
           while (sig(index) == '.') {
             accept('.')
             val name = subName(c => c == ';' || c == '<' || c == '.').toTypeName
@@ -705,11 +711,11 @@ class ClassfileParser(
           | tpnme.RuntimeInvisibleTypeAnnotationATTR =>
           parseTypeAnnotations(attrLen)
 
-          // TODO 1: parse runtime visible annotations on parameters
-          // case tpnme.RuntimeParamAnnotationATTR
+        // TODO 1: parse runtime visible annotations on parameters
+        // case tpnme.RuntimeParamAnnotationATTR
 
-          // TODO 2: also parse RuntimeInvisibleParamAnnotation
-          // i.e. java annotations with RetentionPolicy.CLASS?
+        // TODO 2: also parse RuntimeInvisibleParamAnnotation
+        // i.e. java annotations with RetentionPolicy.CLASS?
 
         case tpnme.ExceptionsATTR =>
           parseExceptions(attrLen)
