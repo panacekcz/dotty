@@ -24,6 +24,10 @@ class Pickler extends Phase {
 
   override def phaseName: String = Pickler.name
 
+  // No need to repickle trees coming from TASTY
+  override def isRunnable(implicit ctx: Context): Boolean =
+    super.isRunnable && !ctx.settings.fromTasty.value
+
   private def output(name: String, msg: String) = {
     val s = new PrintStream(name)
     s.print(msg)
@@ -37,7 +41,7 @@ class Pickler extends Phase {
   /** Drop any elements of this list that are linked module classes of other elements in the list */
   private def dropCompanionModuleClasses(clss: List[ClassSymbol])(implicit ctx: Context): List[ClassSymbol] = {
     val companionModuleClasses =
-      clss.filterNot(_ is Module).map(_.linkedClass).filterNot(_.unforcedIsAbsent)
+      clss.filterNot(_.is(Module)).map(_.linkedClass).filterNot(_.isAbsent())
     clss.filterNot(companionModuleClasses.contains)
   }
 
@@ -45,8 +49,11 @@ class Pickler extends Phase {
     val unit = ctx.compilationUnit
     pickling.println(i"unpickling in run ${ctx.runId}")
 
-    for { cls <- dropCompanionModuleClasses(topLevelClasses(unit.tpdTree))
-          tree <- sliceTopLevel(unit.tpdTree, cls) } {
+    for {
+      cls <- dropCompanionModuleClasses(topLevelClasses(unit.tpdTree))
+      tree <- sliceTopLevel(unit.tpdTree, cls)
+    }
+    {
       val pickler = new TastyPickler(cls)
       if (ctx.settings.YtestPickler.value) {
         beforePickling(cls) = tree.show
@@ -57,7 +64,7 @@ class Pickler extends Phase {
       treePkl.compactify()
       pickler.addrOfTree = treePkl.buf.addrOfTree
       pickler.addrOfSym = treePkl.addrOfSym
-      if (tree.pos.exists)
+      if (tree.span.exists)
         new PositionPickler(pickler, treePkl.buf.addrOfTree).picklePositions(tree :: Nil)
 
       if (!ctx.settings.YdropComments.value)
@@ -71,10 +78,11 @@ class Pickler extends Phase {
         pickled.iterator.grouped(10).toList.zipWithIndex.map {
           case (row, i) => s"${i}0: ${row.mkString(" ")}"
         }
+
       // println(i"rawBytes = \n$rawBytes%\n%") // DEBUG
       if (pickling ne noPrinter) {
         println(i"**** pickled info of $cls")
-        new TastyPrinter(pickler.assembleParts()).printContents()
+        println(new TastyPrinter(pickled).printContents())
       }
     }
   }
@@ -112,7 +120,7 @@ class Pickler extends Phase {
     if (previous != unpickled) {
       output("before-pickling.txt", previous)
       output("after-pickling.txt", unpickled)
-      ctx.error(s"""pickling difference for $cls in ${cls.sourceFile}, for details:
+      ctx.error(s"""pickling difference for $cls in ${cls.source}, for details:
                    |
                    |  diff before-pickling.txt after-pickling.txt""".stripMargin)
     }

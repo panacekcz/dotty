@@ -2,7 +2,7 @@
 layout: blog-page
 title: Announcing Dotty 0.11.0-RC1
 author: Allan Renucci
-authorImg: /images/allan.jpg
+authorImg: images/allan.jpg
 date: 2018-11-30
 ---
 
@@ -95,7 +95,7 @@ interactive errors-as-you-type, etc.
 ![]({{ site.baseurl }}/images/worksheets/worksheet-demo.gif "Run worksheet")
 
 For more information about the worksheets, see [Worksheet mode with Dotty
-IDE](http://dotty.epfl.ch/docs/usage/worksheet-mode.html)
+IDE](https://dotty.epfl.ch/docs/usage/worksheet-mode.html)
 
 ### Various IDE improvements
 

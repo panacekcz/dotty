@@ -4,9 +4,10 @@ package printing
 
 import core._
 import Texts._, ast.Trees._
-import Types.Type, Symbols.Symbol, Scopes.Scope, Constants.Constant,
+import Types.{Type, SingletonType}, Symbols.Symbol, Scopes.Scope, Constants.Constant,
        Names.Name, Denotations._, Annotations.Annotation
 import typer.Implicits.SearchResult
+import util.SourcePosition
 import typer.ImportInfo
 
 import scala.annotation.internal.sharable
@@ -15,7 +16,7 @@ import scala.annotation.internal.sharable
  */
 abstract class Printer {
 
-  private[this] var prec: Precedence = GlobalPrec
+  private var prec: Precedence = GlobalPrec
 
   /** The current precedence level.
    *  When pretty-printing arguments of operator `op`, `currentPrecedence` must equal `op`'s precedence level,
@@ -96,6 +97,9 @@ abstract class Printer {
    */
   def toText(sym: Symbol): Text
 
+  /** Textual representation of singeton type reference */
+  def toTextRef(tp: SingletonType): Text
+
   /** Textual representation of symbol's declaration */
   def dclText(sym: Symbol): Text
 
@@ -133,6 +137,9 @@ abstract class Printer {
 
   /** Textual representation of tree */
   def toText[T >: Untyped](tree: Tree[T]): Text
+
+  /** Textual representation of source position */
+  def toText(pos: SourcePosition): Text
 
   /** Textual representation of implicit search result */
   def toText(result: SearchResult): Text

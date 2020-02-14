@@ -2,14 +2,15 @@ package dotty.tools.dotc
 package core
 package tasty
 
-import scala.collection.mutable
+import dotty.tools.tasty.{TastyFormat, TastyBuffer, TastyReader, TastyHeaderUnpickler}
 import TastyFormat.NameTags._
 import TastyBuffer.NameRef
+
+import scala.collection.mutable
 import Names.{TermName, termName, EmptyTermName}
 import NameKinds._
 
 object TastyUnpickler {
-  class UnpickleException(msg: String) extends RuntimeException(msg)
 
   abstract class SectionUnpickler[R](val name: String) {
     def unpickle(reader: TastyReader, nameAtRef: NameTable): R
@@ -36,6 +37,14 @@ class TastyUnpickler(reader: TastyReader) {
   private def readName(): TermName = nameAtRef(readNameRef())
   private def readString(): String = readName().toString
 
+  private def readParamSig(): Signature.ParamSig = {
+    val ref = readInt()
+    if (ref < 0)
+      ref.abs
+    else
+      nameAtRef(NameRef(ref)).toTypeName
+  }
+
   private def readNameContents(): TermName = {
     val tag = readByte()
     val length = readNat()
@@ -53,13 +62,15 @@ class TastyUnpickler(reader: TastyReader) {
         val originals = until(end)(readName())
         val original = if (originals.isEmpty) EmptyTermName else originals.head
         uniqueNameKindOfSeparator(separator)(original, num)
-      case DEFAULTGETTER | VARIANT =>
+      case DEFAULTGETTER =>
         numberedNameKindOfTag(tag)(readName(), readNat())
       case SIGNED =>
         val original = readName()
         val result = readName().toTypeName
-        val params = until(end)(readName().toTypeName)
-        var sig = Signature(params, result)
+        // DOTTY: we shouldn't have to give an explicit type to paramsSig,
+        // see https://github.com/lampepfl/dotty/issues/4867
+        val paramsSig: List[Signature.ParamSig] = until(end)(readParamSig())
+        val sig = Signature(paramsSig, result)
         SignedName(original, sig)
       case _ =>
         simpleNameKindOfTag(tag)(readName())

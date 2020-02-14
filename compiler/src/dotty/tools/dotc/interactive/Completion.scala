@@ -1,6 +1,9 @@
 package dotty.tools.dotc.interactive
 
+import java.nio.charset.Charset
+
 import dotty.tools.dotc.ast.Trees._
+import dotty.tools.dotc.ast.untpd
 import dotty.tools.dotc.config.Printers.interactiv
 import dotty.tools.dotc.core.Contexts.{Context, NoContext}
 import dotty.tools.dotc.core.CheckRealizable
@@ -10,13 +13,13 @@ import dotty.tools.dotc.core.Flags._
 import dotty.tools.dotc.core.Names.{Name, TermName}
 import dotty.tools.dotc.core.NameKinds.SimpleNameKind
 import dotty.tools.dotc.core.NameOps.NameDecorator
-import dotty.tools.dotc.core.Symbols.{defn, NoSymbol, Symbol}
+import dotty.tools.dotc.core.Symbols.{NoSymbol, Symbol, defn}
 import dotty.tools.dotc.core.Scopes
 import dotty.tools.dotc.core.StdNames.{nme, tpnme}
 import dotty.tools.dotc.core.TypeError
-import dotty.tools.dotc.core.Types.{NameFilter, NamedType, Type, NoType}
+import dotty.tools.dotc.core.Types.{NameFilter, NamedType, NoType, Type}
 import dotty.tools.dotc.printing.Texts._
-import dotty.tools.dotc.util.{NoSourcePosition, SourcePosition}
+import dotty.tools.dotc.util.{NameTransformer, NoSourcePosition, SourcePosition}
 
 import scala.collection.mutable
 
@@ -40,7 +43,7 @@ object Completion {
    *  @return offset and list of symbols for possible completions
    */
   def completions(pos: SourcePosition)(implicit ctx: Context): (Int, List[Completion]) = {
-    val path = Interactive.pathTo(ctx.compilationUnit.tpdTree, pos.pos)
+    val path = Interactive.pathTo(ctx.compilationUnit.tpdTree, pos.span)
     computeCompletions(pos, path)(Interactive.contextOfPath(path))
   }
 
@@ -54,15 +57,15 @@ object Completion {
    *
    * Otherwise, provide no completion suggestion.
    */
-  private def completionMode(path: List[Tree], pos: SourcePosition): Mode = {
+  private def completionMode(path: List[Tree], pos: SourcePosition): Mode =
     path match {
       case (ref: RefTree) :: _ =>
         if (ref.name.isTermName) Mode.Term
         else if (ref.name.isTypeName) Mode.Type
         else Mode.None
 
-      case Thicket(name :: _ :: Nil) :: (_: Import) :: _ =>
-        if (name.pos.contains(pos.pos)) Mode.Import
+      case (sel: untpd.ImportSelector) :: _ =>
+        if sel.imported.span.contains(pos.span) then Mode.Import
         else Mode.None // Can't help completing the renaming
 
       case Import(_, _) :: _ =>
@@ -71,38 +74,35 @@ object Completion {
       case _ =>
         Mode.None
     }
-  }
 
   /**
    * Inspect `path` to determine the completion prefix. Only symbols whose name start with the
    * returned prefix should be considered.
    */
-  private def completionPrefix(path: List[Tree], pos: SourcePosition): String = {
+  private def completionPrefix(path: List[untpd.Tree], pos: SourcePosition): String =
     path match {
-      case Thicket(name :: _ :: Nil) :: (_: Import) :: _ =>
-        completionPrefix(name :: Nil, pos)
+      case (sel: untpd.ImportSelector) :: _ =>
+        completionPrefix(sel.imported :: Nil, pos)
 
       case Import(expr, selectors) :: _ =>
-        selectors.find(_.pos.contains(pos.pos)).map { selector =>
-          completionPrefix(selector.asInstanceOf[Tree] :: Nil, pos)
+        selectors.find(_.span.contains(pos.span)).map { selector =>
+          completionPrefix(selector :: Nil, pos)
         }.getOrElse("")
 
       case (ref: RefTree) :: _ =>
         if (ref.name == nme.ERROR) ""
-        else ref.name.toString.take(pos.pos.point - ref.pos.point)
+        else ref.name.toString.take(pos.span.point - ref.span.point)
 
       case _ =>
         ""
     }
-  }
 
   /** Inspect `path` to determine the offset where the completion result should be inserted. */
-  private def completionOffset(path: List[Tree]): Int = {
+  private def completionOffset(path: List[Tree]): Int =
     path match {
-      case (ref: RefTree) :: _ => ref.pos.point
+      case (ref: RefTree) :: _ => ref.span.point
       case _ => 0
     }
-  }
 
   /** Create a new `CompletionBuffer` for completing at `pos`. */
   private def completionBuffer(path: List[Tree], pos: SourcePosition): CompletionBuffer = {
@@ -116,14 +116,13 @@ object Completion {
     val offset = completionOffset(path)
     val buffer = completionBuffer(path, pos)
 
-    if (buffer.mode != Mode.None) {
+    if (buffer.mode != Mode.None)
       path match {
-        case Select(qual, _) :: _                 => buffer.addMemberCompletions(qual)
-        case Import(expr, _) :: _                 => buffer.addMemberCompletions(expr)
-        case (_: Thicket) :: Import(expr, _) :: _ => buffer.addMemberCompletions(expr)
-        case _                                    => buffer.addScopeCompletions
+        case Select(qual, _) :: _                              => buffer.addMemberCompletions(qual)
+        case Import(expr, _) :: _                              => buffer.addMemberCompletions(expr) // TODO: distinguish given from plain imports
+        case (_: untpd.ImportSelector) :: Import(expr, _) :: _ => buffer.addMemberCompletions(expr)
+        case _                                                 => buffer.addScopeCompletions
       }
-    }
 
     val completionList = buffer.getCompletions
 
@@ -137,10 +136,10 @@ object Completion {
 
   private class CompletionBuffer(val mode: Mode, val prefix: String, pos: SourcePosition) {
 
-    private[this] val completions = new RenameAwareScope
+    private val completions = new RenameAwareScope
 
     /**
-     * Return the list of symbols that shoudl be included in completion results.
+     * Return the list of symbols that should be included in completion results.
      *
      * If several symbols share the same name, the type symbols appear before term symbols inside
      * the same `Completion`.
@@ -150,7 +149,7 @@ object Completion {
       nameToSymbols.map { case (name, symbols) =>
         val typesFirst = symbols.sortWith((s1, s2) => s1.isType && !s2.isType)
         val desc = description(typesFirst)
-        Completion(name.toString, desc, typesFirst)
+        Completion(name.show, desc, typesFirst)
       }
     }
 
@@ -162,7 +161,7 @@ object Completion {
      *
      * When there are multiple symbols, show their kinds.
      */
-    private def description(symbols: List[Symbol])(implicit ctx: Context): String = {
+    private def description(symbols: List[Symbol])(implicit ctx: Context): String =
       symbols match {
         case sym :: Nil =>
           if (sym.isType) sym.showFullName
@@ -174,7 +173,6 @@ object Completion {
         case Nil =>
           ""
       }
-    }
 
     /**
      * Add symbols that are currently in scope to `info`: the members of the current class and the
@@ -206,14 +204,15 @@ object Completion {
      * If `info.mode` is `Import`, the members added via implicit conversion on `qual` are not
      * considered.
      */
-    def addMemberCompletions(qual: Tree)(implicit ctx: Context): Unit = {
-      addAccessibleMembers(qual.tpe)
-      if (!mode.is(Mode.Import)) {
-        // Implicit conversions do not kick in when importing
-        implicitConversionTargets(qual)(ctx.fresh.setExploreTyperState())
-          .foreach(addAccessibleMembers)
+    def addMemberCompletions(qual: Tree)(implicit ctx: Context): Unit =
+      if (!qual.tpe.widenDealias.isBottomType) {
+        addAccessibleMembers(qual.tpe)
+        if (!mode.is(Mode.Import) && !qual.tpe.isNullType)
+          // Implicit conversions do not kick in when importing
+          // and for `NullClass` they produce unapplicable completions (for unclear reasons)
+          implicitConversionTargets(qual)(ctx.fresh.setExploreTyperState())
+            .foreach(addAccessibleMembers)
       }
-    }
 
     /**
      * If `sym` exists, no symbol with the same name is already included, and it satisfies the
@@ -223,15 +222,13 @@ object Completion {
       if (sym.exists &&
           completionsFilter(NoType, nameInScope) &&
           !completions.lookup(nameInScope).exists &&
-          include(sym, nameInScope)) {
+          include(sym, nameInScope))
         completions.enter(sym, nameInScope)
-      }
 
     /** Lookup members `name` from `site`, and try to add them to the completion list. */
     private def addMember(site: Type, name: Name, nameInScope: Name)(implicit ctx: Context) =
-      if (!completions.lookup(nameInScope).exists) {
+      if (!completions.lookup(nameInScope).exists)
         for (alt <- site.member(name).alternatives) add(alt.symbol, nameInScope)
-      }
 
     /** Include in completion sets only symbols that
      *   1. start with given name prefix, and
@@ -240,18 +237,22 @@ object Completion {
      *   4. have an existing source symbol,
      *   5. are the module class in case of packages,
      *   6. are mutable accessors, to exclude setters for `var`,
-     *   7. have same term/type kind as name prefix given so far
+     *   7. symbol is not a package object
+     *   8. symbol is not an artifact of the compiler
+     *   9. have same term/type kind as name prefix given so far
      */
     private def include(sym: Symbol, nameInScope: Name)(implicit ctx: Context): Boolean =
       nameInScope.startsWith(prefix) &&
-      !sym.isAbsent &&
+      !sym.isAbsent() &&
       !sym.isPrimaryConstructor &&
       sym.sourceSymbol.exists &&
-      (!sym.is(Package) || !sym.moduleClass.exists) &&
-      !sym.is(allOf(Mutable, Accessor)) &&
+      (!sym.is(Package) || sym.is(ModuleClass)) &&
+      !sym.isAllOf(Mutable | Accessor) &&
+      !sym.isPackageObject &&
+      !sym.is(Artifact) &&
       (
            (mode.is(Mode.Term) && sym.isTerm)
-        || (mode.is(Mode.Type) && (sym.isType || sym.isStable))
+        || (mode.is(Mode.Type) && (sym.isType || sym.isStableMember))
       )
 
     /**
@@ -290,9 +291,8 @@ object Completion {
           addMember(imp.site, name.toTypeName, nameInScope.toTypeName)
         }
         imp.reverseMapping.foreachBinding { (nameInScope, original) =>
-          if (original != nameInScope || !imp.excluded.contains(original)) {
+          if (original != nameInScope || !imp.excluded.contains(original))
             addImport(original, nameInScope)
-          }
         }
         if (imp.isWildcardImport)
           for (mbr <- accessibleMembers(imp.site) if !imp.excluded.contains(mbr.name.toTermName))
@@ -309,18 +309,17 @@ object Completion {
      */
     private def implicitConversionTargets(qual: Tree)(implicit ctx: Context): Set[Type] = {
       val typer = ctx.typer
-      val conversions = new typer.ImplicitSearch(defn.AnyType, qual, pos.pos).allImplicits
+      val conversions = new typer.ImplicitSearch(defn.AnyType, qual, pos.span).allImplicits
       val targets = conversions.map(_.widen.finalResultType)
       interactiv.println(i"implicit conversion targets considered: ${targets.toList}%, %")
       targets
     }
 
     /** Filter for names that should appear when looking for completions. */
-   private[this] object completionsFilter extends NameFilter {
-     def apply(pre: Type, name: Name)(implicit ctx: Context): Boolean =
-       !name.isConstructorName && name.toTermName.info.kind == SimpleNameKind
-   }
-
+    private object completionsFilter extends NameFilter {
+      def apply(pre: Type, name: Name)(implicit ctx: Context): Boolean =
+        !name.isConstructorName && name.toTermName.info.kind == SimpleNameKind
+    }
   }
 
   /**
@@ -345,23 +344,23 @@ object Completion {
     val Import: Mode = new Mode(4) | Term | Type
   }
 
-   /** A scope that tracks renames of the entered symbols.
-    *  Useful for providing completions for renamed symbols
-    *  in the REPL and the IDE.
-    */
-   private class RenameAwareScope extends Scopes.MutableScope {
-     private[this] val nameToSymbols: mutable.Map[TermName, List[Symbol]] = mutable.Map.empty
+  /** A scope that tracks renames of the entered symbols.
+   *  Useful for providing completions for renamed symbols
+   *  in the REPL and the IDE.
+   */
+  private class RenameAwareScope extends Scopes.MutableScope {
+    private val nameToSymbols: mutable.Map[TermName, List[Symbol]] = mutable.Map.empty
 
-     /** Enter the symbol `sym` in this scope, recording a potential renaming. */
-     def enter[T <: Symbol](sym: T, name: Name)(implicit ctx: Context): T = {
-       val termName = name.stripModuleClassSuffix.toTermName
-       nameToSymbols += termName -> (sym :: nameToSymbols.getOrElse(termName, Nil))
-       newScopeEntry(name, sym)
-       sym
-     }
+    /** Enter the symbol `sym` in this scope, recording a potential renaming. */
+    def enter[T <: Symbol](sym: T, name: Name)(implicit ctx: Context): T = {
+      val termName = name.stripModuleClassSuffix.toTermName
+      nameToSymbols += termName -> (sym :: nameToSymbols.getOrElse(termName, Nil))
+      newScopeEntry(name, sym)
+      sym
+    }
 
-     /** Get the names that are known in this scope, along with the list of symbols they refer to. */
-     def mappings: Map[TermName, List[Symbol]] = nameToSymbols.toMap
-   }
-
+    /** Get the names that are known in this scope, along with the list of symbols they refer to. */
+    def mappings: Map[TermName, List[Symbol]] = nameToSymbols.toMap
+  }
 }
+

@@ -46,7 +46,7 @@ class HoverTest {
           |  ${m1}val x = ${m2}8$m3; ${m4}x$m5
           |}""".withSource
       .hover(m1 to m2, hoverContent("Int"))
-      .hover(m2 to m3, hoverContent("Int(8)"))
+      .hover(m2 to m3, hoverContent("(8 : Int)"))
       .hover(m4 to m5, hoverContent("Int"))
   }
 
@@ -54,8 +54,8 @@ class HoverTest {
     code"""class Foo {
           |  ${m1}final val x = 8$m2; ${m3}x$m4
           |}""".withSource
-      .hover(m1 to m2, hoverContent("Int(8)"))
-      .hover(m3 to m4, hoverContent("Int(8)"))
+      .hover(m1 to m2, hoverContent("(8 : Int)"))
+      .hover(m3 to m4, hoverContent("(8 : Int)"))
   }
 
   @Test def hoverOnDefDef0: Unit = {
@@ -63,7 +63,7 @@ class HoverTest {
           |  ${m1}def x = ${m2}8$m3; ${m4}x$m5
           |}""".withSource
       .hover(m1 to m2, hoverContent("Int"))
-      .hover(m2 to m3, hoverContent("Int(8)"))
+      .hover(m2 to m3, hoverContent("(8 : Int)"))
       .hover(m4 to m5, hoverContent("Int"))
   }
 
@@ -83,7 +83,7 @@ class HoverTest {
           |  ${m5}y($m6)$m7
           |}
         """.withSource
-      .hover(m1 to m2, hoverContent("String(\"abc\")" ))
+      .hover(m1 to m2, hoverContent("(\"abc\" : String)"))
       .hover(m3 to m4, hoverContent("String"))
       .hover(m5 to m6, hoverContent("(): Int"))
       .hover(m6 to m7, hoverContent("Int"))
@@ -173,5 +173,40 @@ class HoverTest {
           |  def ${m1}baz${m2}: Int = ???
           |}""".withSource
       .hover(m1 to m2, hoverContent("Int", "hello"))
+  }
+
+  @Test def i4678: Unit = {
+    code"""class Foo {
+          |  val x: Int = (${m1}1:${m2} ${m3}@annot1 @annot2 @annot3 @annot4 @annot5${m4})
+          |}
+          |class annot1 extends scala.annotation.Annotation
+          |class annot2 extends scala.annotation.Annotation
+          |class annot3 extends scala.annotation.Annotation
+          |class annot4 extends scala.annotation.Annotation
+          |class annot5 extends scala.annotation.Annotation
+          |""".withSource
+      .hover(m1 to m2, hoverContent("(1 : Int)"))
+      .hover(m3 to m4, hoverContent("(1 : Int) @annot1 @annot2 @annot3 @annot4 @annot5"))
+  }
+
+  @Test def unicodeChar: Unit = {
+    code"""object Test {
+          |  type →
+          |  type `🤪`
+          |  def ${m1}bar${m2}: → = ???
+          |  def ${m3}baz${m4}: `🤪` = ???
+          |}""".withSource
+      .hover(m1 to m2, hoverContent("Test.→"))
+      .hover(m3 to m4, hoverContent("Test.🤪"))
+
+  }
+
+  @Test def topLevel: Unit = {
+    code"""package hello
+          |val x: Int = 1
+          |val y = ${m1}this${m2}.x""".withSource
+      // The test framework will place the code above in a virtual file called Source0.scala,
+      // sp the top-level definitions should be enclosed in an object called `Source0$package`.
+      .hover(m1 to m2, hoverContent("(hello.Source0$package : hello.Source0$package.type)"))
   }
 }

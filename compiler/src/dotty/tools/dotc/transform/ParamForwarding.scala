@@ -48,7 +48,7 @@ class ParamForwarding(thisPhase: DenotTransformer) {
          * }
          */
         val candidate = sym.owner.asClass.superClass
-          .info.decl(sym.name).suchThat(_ is (ParamAccessor, butNot = Mutable)).symbol
+          .info.decl(sym.name).suchThat(_.is(ParamAccessor, butNot = Mutable)).symbol
         if (candidate.isAccessibleFrom(currentClass.thisType, superAccess = true)) candidate
         else if (candidate.exists) inheritedAccessor(candidate)
         else NoSymbol
@@ -65,12 +65,12 @@ class ParamForwarding(thisPhase: DenotTransformer) {
                 val alias = inheritedAccessor(sym)
                 if (alias.exists) {
                   def forwarder(implicit ctx: Context) = {
-                    sym.copySymDenotation(initFlags = sym.flags | Method | Stable, info = sym.info.ensureMethodic)
+                    sym.copySymDenotation(initFlags = sym.flags | Method | StableRealizable, info = sym.info.ensureMethodic)
                       .installAfter(thisPhase)
                     val superAcc =
                       Super(This(currentClass), tpnme.EMPTY, inConstrCall = false).select(alias)
                     typr.println(i"adding param forwarder $superAcc")
-                    DefDef(sym, superAcc.ensureConforms(sym.info.widen)).withPos(stat.pos)
+                    DefDef(sym, superAcc.ensureConforms(sym.info.widen)).withSpan(stat.span)
                   }
                   return forwarder(ctx.withPhase(thisPhase.next))
                 }

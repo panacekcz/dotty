@@ -85,7 +85,7 @@ class ShortcutImplicits extends MiniPhase with IdentityDenotTransformer { thisPh
   /** Transform `qual.apply` occurrences according to rewrite rule (2) above */
   override def transformSelect(tree: Select)(implicit ctx: Context): Tree =
     if (tree.name == nme.apply &&
-        defn.isImplicitFunctionType(tree.qualifier.tpe.widen) &&
+        defn.isContextFunctionType(tree.qualifier.tpe.widen) &&
         needsImplicitShortcut(tree.qualifier.symbol)) {
       def directQual(tree: Tree): Tree = tree match {
         case Apply(fn, args)     => cpy.Apply(tree)(directQual(fn), args)
@@ -96,7 +96,8 @@ class ShortcutImplicits extends MiniPhase with IdentityDenotTransformer { thisPh
             .withType(tree.tpe.asInstanceOf[NamedType].prefix.select(directMethod(tree.symbol)))
       }
       directQual(tree.qualifier)
-    } else tree
+    }
+    else tree
 
   /** Transform methods with implicit function type result according to rewrite rule (1) above */
   override def transformDefDef(mdef: DefDef)(implicit ctx: Context): Tree = {
@@ -129,6 +130,9 @@ class ShortcutImplicits extends MiniPhase with IdentityDenotTransformer { thisPh
             .appliedToArgss(vparamSymss.map(_.map(ref(_))) :+ clparamSyms.map(ref(_)))
           val fwdClosure = cpy.Block(tree)(cpy.DefDef(meth)(rhs = forwarder) :: Nil, cl)
           (remappedCore, fwdClosure)
+        case id: RefTree =>
+          val SAMType(mt) = id.tpe.widen
+          splitClosure(tpd.Lambda(mt, args => id.select(nme.apply).appliedToArgs(args))(ctx.withOwner(original)))
         case EmptyTree =>
           (_ => _ => EmptyTree, EmptyTree)
       }
@@ -161,7 +165,7 @@ object ShortcutImplicits {
     */
   def needsImplicitShortcut(sym: Symbol)(implicit ctx: Context): Boolean =
     sym.is(Method, butNot = Accessor) &&
-    defn.isImplicitFunctionType(sym.info.finalResultType) &&
+    defn.isContextFunctionType(sym.info.finalResultType) &&
     defn.functionArity(sym.info.finalResultType) > 0 &&
     !sym.isAnonymousFunction &&
     (specializeMonoTargets || !sym.isEffectivelyFinal || sym.allOverriddenSymbols.nonEmpty)

@@ -13,7 +13,7 @@ class InlineBytecodeTests extends DottyBytecodeTest {
     val source = """
                  |class Foo {
                  |  inline def foo: Int = 1
-                 |  @forceInline def bar: Int = 1
+                 |  inline def bar: Int = 1
                  |
                  |  def meth1: Unit = foo
                  |  def meth2: Unit = bar
@@ -44,7 +44,7 @@ class InlineBytecodeTests extends DottyBytecodeTest {
 
   @Test def i4947 = {
     val source = """class Foo {
-                   |  inline def track[T](f: => T) <: T = {
+                   |  inline def track[T](inline f: T) <: T = {
                    |    foo("tracking") // line 3
                    |    f // line 4
                    |  }
@@ -95,19 +95,19 @@ class InlineBytecodeTests extends DottyBytecodeTest {
           Op(RETURN),
           Label(22)
         )
-        assert(instructions == expected,
-          "`track` was not properly inlined in `main`\n" + diffInstructions(instructions, expected))
+      assert(instructions == expected,
+        "`track` was not properly inlined in `main`\n" + diffInstructions(instructions, expected))
 
     }
   }
 
   @Test def i4947b = {
     val source = """class Foo {
-                   |  inline def track2[T](f: => T) <: T = {
+                   |  inline def track2[T](inline f: T) <: T = {
                    |    foo("tracking2") // line 3
                    |    f // line 4
                    |  }
-                   |  inline def track[T](f: => T) <: T = {
+                   |  inline def track[T](inline f: T) <: T = {
                    |    foo("tracking") // line 7
                    |    track2 { // line 8
                    |      f // line 9
@@ -155,19 +155,19 @@ class InlineBytecodeTests extends DottyBytecodeTest {
           Op(RETURN),
           Label(17)
         )
-        assert(instructions == expected,
-          "`track` was not properly inlined in `main`\n" + diffInstructions(instructions, expected))
+      assert(instructions == expected,
+        "`track` was not properly inlined in `main`\n" + diffInstructions(instructions, expected))
 
     }
   }
 
   @Test def i4947c = {
     val source = """class Foo {
-                   |  inline def track2[T](f: => T) <: T = {
+                   |  inline def track2[T](inline f: T) <: T = {
                    |    foo("tracking2") // line 3
                    |    f // line 4
                    |  }
-                   |  inline def track[T](f: => T) <: T = {
+                   |  inline def track[T](inline f: T) <: T = {
                    |    track2 { // line 7
                    |      foo("fgh") // line 8
                    |      f // line 9
@@ -215,19 +215,19 @@ class InlineBytecodeTests extends DottyBytecodeTest {
           Op(RETURN),
           Label(17)
         )
-        assert(instructions == expected,
-          "`track` was not properly inlined in `main`\n" + diffInstructions(instructions, expected))
+      assert(instructions == expected,
+        "`track` was not properly inlined in `main`\n" + diffInstructions(instructions, expected))
 
     }
   }
 
   @Test def i4947d = {
     val source = """class Foo {
-                   |  inline def track2[T](f: => T) <: T = {
+                   |  inline def track2[T](inline f: T) <: T = {
                    |    foo("tracking2") // line 3
                    |    f // line 4
                    |  }
-                   |  inline def track[T](f: => T) <: T = {
+                   |  inline def track[T](inline f: T) <: T = {
                    |    track2 { // line 7
                    |      track2 { // line 8
                    |        f // line 9
@@ -276,8 +276,8 @@ class InlineBytecodeTests extends DottyBytecodeTest {
           Op(RETURN),
           Label(17)
         )
-        assert(instructions == expected,
-          "`track` was not properly inlined in `main`\n" + diffInstructions(instructions, expected))
+      assert(instructions == expected,
+        "`track` was not properly inlined in `main`\n" + diffInstructions(instructions, expected))
 
     }
   }
@@ -315,8 +315,8 @@ class InlineBytecodeTests extends DottyBytecodeTest {
           , VarOp(ILOAD, 1)
           , Op(IRETURN)
         )
-        assert(instructions == expected,
-          "`f` was not properly inlined in `fun`\n" + diffInstructions(instructions, expected))
+      assert(instructions == expected,
+        "`f` was not properly inlined in `fun`\n" + diffInstructions(instructions, expected))
 
     }
   }

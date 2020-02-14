@@ -66,7 +66,7 @@ abstract class ZipArchive(override val jpath: JPath) extends AbstractFile with E
   def absolute: AbstractFile  = unsupported()
 
   /** ''Note:  This library is considered experimental and should not be used unless you know what you are doing.'' */
-  sealed abstract class Entry(path: String) extends VirtualFile(baseName(path), path) {
+  sealed abstract class Entry(path: String, val parent: Entry) extends VirtualFile(baseName(path), path) {
     // have to keep this name for compat with sbt's compiler-interface
     def getArchive: ZipFile = null
     override def underlyingSource: Option[ZipArchive] = Some(self)
@@ -74,7 +74,7 @@ abstract class ZipArchive(override val jpath: JPath) extends AbstractFile with E
   }
 
   /** ''Note:  This library is considered experimental and should not be used unless you know what you are doing.'' */
-  class DirEntry(path: String) extends Entry(path) {
+  class DirEntry(path: String, parent: Entry) extends Entry(path, parent) {
     val entries: mutable.HashMap[String, Entry] = mutable.HashMap()
 
     override def isDirectory: Boolean = true
@@ -98,7 +98,7 @@ abstract class ZipArchive(override val jpath: JPath) extends AbstractFile with E
       case Some(v) => v
       case None =>
         val parent = ensureDir(dirs, dirName(path), null)
-        val dir    = new DirEntry(path)
+        val dir    = new DirEntry(path, parent)
         parent.entries(baseName(path)) = dir
         dirs(path) = dir
         dir
@@ -111,23 +111,24 @@ abstract class ZipArchive(override val jpath: JPath) extends AbstractFile with E
 }
 /** ''Note:  This library is considered experimental and should not be used unless you know what you are doing.'' */
 final class FileZipArchive(jpath: JPath) extends ZipArchive(jpath) {
-  private[this] def openZipFile(): ZipFile = try {
+  private def openZipFile(): ZipFile = try {
     new ZipFile(file)
   } catch {
     case ioe: IOException => throw new IOException("Error accessing " + file.getPath, ioe)
   }
 
-  private[this] class LazyEntry(
+  private class LazyEntry(
     name: String,
     time: Long,
-    size: Int
-  ) extends Entry(name) {
+    size: Int,
+    parent: DirEntry
+  ) extends Entry(name, parent) {
     override def lastModified: Long = time // could be stale
     override def input: InputStream = {
       val zipFile  = openZipFile()
       val entry    = zipFile.getEntry(name)
-      val delegate = zipFile.getInputStream(entry)
-      new FilterInputStream(delegate) {
+      val `delegate` = zipFile.getInputStream(entry)
+      new FilterInputStream(`delegate`) {
         override def close(): Unit = { zipFile.close() }
       }
     }
@@ -138,17 +139,18 @@ final class FileZipArchive(jpath: JPath) extends ZipArchive(jpath) {
   // on Windows, and leaks memory on all OS (typically by stopping
   // classloaders from being garbage collected). But is slightly
   // faster than LazyEntry.
-  private[this] class LeakyEntry(
+  private class LeakyEntry(
     zipFile: ZipFile,
-    zipEntry: ZipEntry
-  ) extends Entry(zipEntry.getName) {
+    zipEntry: ZipEntry,
+    parent: DirEntry
+  ) extends Entry(zipEntry.getName, parent) {
     override def lastModified: Long = zipEntry.getTime
     override def input: InputStream = zipFile.getInputStream(zipEntry)
     override def sizeOption: Option[Int] = Some(zipEntry.getSize.toInt)
   }
 
   @volatile lazy val (root, allDirs): (DirEntry, collection.Map[String, DirEntry]) = {
-    val root = new DirEntry("/")
+    val root = new DirEntry("/", null)
     val dirs = mutable.HashMap[String, DirEntry]("/" -> root)
     val zipFile = openZipFile()
     val entries = zipFile.entries()
@@ -157,17 +159,17 @@ final class FileZipArchive(jpath: JPath) extends ZipArchive(jpath) {
       while (entries.hasMoreElements) {
         val zipEntry = entries.nextElement
         val dir = getDir(dirs, zipEntry)
-        if (zipEntry.isDirectory) dir
-        else {
+        if (!zipEntry.isDirectory) {
           val f =
             if (ZipArchive.closeZipFile)
               new LazyEntry(
                 zipEntry.getName(),
                 zipEntry.getTime(),
-                zipEntry.getSize().toInt
+                zipEntry.getSize().toInt,
+                dir
               )
             else
-              new LeakyEntry(zipFile, zipEntry)
+              new LeakyEntry(zipFile, zipEntry, dir)
 
           dir.entries(f.name) = f
         }
@@ -196,7 +198,7 @@ final class FileZipArchive(jpath: JPath) extends ZipArchive(jpath) {
 
 final class ManifestResources(val url: URL) extends ZipArchive(null) {
   def iterator(): Iterator[AbstractFile] = {
-    val root     = new DirEntry("/")
+    val root     = new DirEntry("/", null)
     val dirs     = mutable.HashMap[String, DirEntry]("/" -> root)
     val manifest = new Manifest(input)
     val iter     = manifest.getEntries().keySet().iterator().asScala.filter(_.endsWith(".class")).map(new ZipEntry(_))
@@ -204,7 +206,7 @@ final class ManifestResources(val url: URL) extends ZipArchive(null) {
     for (zipEntry <- iter) {
       val dir = getDir(dirs, zipEntry)
       if (!zipEntry.isDirectory) {
-        val f = new Entry(zipEntry.getName) {
+        val f = new Entry(zipEntry.getName, dir) {
           override def lastModified = zipEntry.getTime()
           override def input        = resourceInputStream(path)
           override def sizeOption   = None

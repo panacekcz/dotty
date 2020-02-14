@@ -1,10 +1,11 @@
-package dotty.tools.dotc
+package dotty.tools
+package dotc
 package core
 
 import annotation.tailrec
 import Symbols._
 import Contexts._, Names._, Phases._, printing.Texts._, printing.Printer
-import util.Positions.Position, util.SourcePosition
+import util.Spans.Span, util.SourcePosition
 import collection.mutable.ListBuffer
 import dotty.tools.dotc.transform.MegaPhase
 import ast.tpd._
@@ -54,10 +55,10 @@ object Decorators {
     final def mapconserve[U](f: T => U): List[U] = {
       @tailrec
       def loop(mapped: ListBuffer[U], unchanged: List[U], pending: List[T]): List[U] =
-        if (pending.isEmpty) {
+        if (pending.isEmpty)
           if (mapped eq null) unchanged
           else mapped.prependToList(unchanged)
-        } else {
+        else {
           val head0 = pending.head
           val head1 = f(head0)
 
@@ -92,12 +93,13 @@ object Decorators {
               if (ys1 eq xs1) xs else x :: ys1
             else
               ys1
-          } else xs filter p
+          }
+          else xs filter p
       }
       loop(xs, 0)
     }
 
-    /** Like `(xs, ys).zipped.map(f)`, but returns list `xs` itself
+    /** Like `xs.lazyZip(ys).map(f)`, but returns list `xs` itself
      *  - instead of a copy - if function `f` maps all elements of
      *  `xs` to themselves. Also, it is required that `ys` is at least
      *  as long as `xs`.
@@ -111,6 +113,22 @@ object Decorators {
             (xs1 eq xs.tail)) xs
         else x1 :: xs1
       }
+
+    /** Like `xs.lazyZip(xs.indices).map(f)`, but returns list `xs` itself
+     *  - instead of a copy - if function `f` maps all elements of
+     *  `xs` to themselves.
+     */
+    def mapWithIndexConserve[U <: T](f: (T, Int) => U): List[U] =
+      def recur(xs: List[T], idx: Int): List[U] =
+        if xs.isEmpty then Nil
+        else
+          val x1 = f(xs.head, idx)
+          val xs1 = recur(xs.tail, idx + 1)
+          if (x1.asInstanceOf[AnyRef] eq xs.head.asInstanceOf[AnyRef])
+             && (xs1 eq xs.tail)
+          then xs.asInstanceOf[List[U]]
+          else x1 :: xs1
+      recur(xs, 0)
 
     final def hasSameLengthAs[U](ys: List[U]): Boolean = {
       @tailrec def loop(xs: List[T], ys: List[U]): Boolean =
@@ -131,7 +149,7 @@ object Decorators {
     }
 
     /** Union on lists seen as sets */
-    def | (ys: List[T]): List[T] = xs ++ (ys filterNot (xs contains _))
+    def | (ys: List[T]): List[T] = xs ::: (ys filterNot (xs contains _))
 
     /** Intersection on lists seen as sets */
     def & (ys: List[T]): List[T] = xs filter (ys contains _)
@@ -151,35 +169,33 @@ object Decorators {
    *  exact meaning of "contains" here.
    */
   implicit class PhaseListDecorator(val names: List[String]) extends AnyVal {
-    def containsPhase(phase: Phase): Boolean = phase match {
-      case phase: MegaPhase => phase.miniPhases.exists(containsPhase)
-      case _ =>
-        names exists { name =>
-          name == "all" || {
-            val strippedName = name.stripSuffix("+")
-            val logNextPhase = name != strippedName
-            phase.phaseName.startsWith(strippedName) ||
-              (logNextPhase && phase.prev.phaseName.startsWith(strippedName))
-          }
+    def containsPhase(phase: Phase): Boolean =
+      names.nonEmpty && {
+        phase match {
+          case phase: MegaPhase => phase.miniPhases.exists(containsPhase)
+          case _ =>
+            names exists { name =>
+              name == "all" || {
+                val strippedName = name.stripSuffix("+")
+                val logNextPhase = name != strippedName
+                phase.phaseName.startsWith(strippedName) ||
+                  (logNextPhase && phase.prev.phaseName.startsWith(strippedName))
+              }
+            }
         }
-    }
+      }
   }
 
-  implicit def sourcePos(pos: Position)(implicit ctx: Context): SourcePosition = {
-    def recur(inlinedCalls: List[Tree], pos: Position): SourcePosition = inlinedCalls match {
-      case inlinedCall :: rest =>
-        sourceFile(inlinedCall).atPos(pos).withOuter(recur(rest, inlinedCall.pos))
-      case empty =>
-        ctx.source.atPos(pos)
+  implicit class reportDeco[T](x: T) extends AnyVal {
+    def reporting(
+        op: WrappedResult[T] ?=> String,
+        printer: config.Printers.Printer = config.Printers.default): T = {
+      printer.println(op(using WrappedResult(x)))
+      x
     }
-    recur(enclosingInlineds, pos)
   }
 
   implicit class genericDeco[T](val x: T) extends AnyVal {
-    def reporting(op: T => String, printer: config.Printers.Printer = config.Printers.default): T = {
-      printer.println(op(x))
-      x
-    }
     def assertingErrorsReported(implicit ctx: Context): T = {
       assert(ctx.reporter.errorsReported)
       x
@@ -191,7 +207,6 @@ object Decorators {
   }
 
   implicit class StringInterpolators(val sc: StringContext) extends AnyVal {
-
     /** General purpose string formatting */
     def i(args: Any*)(implicit ctx: Context): String =
       new StringFormatter(sc).assemble(args)
@@ -206,11 +221,7 @@ object Decorators {
      *  give more info about type variables and to disambiguate where needed.
      */
     def ex(args: Any*)(implicit ctx: Context): String =
-      explained(implicit ctx => em(args: _*))
-
-    /** Formatter that adds syntax highlighting to all interpolated values */
-    def hl(args: Any*)(implicit ctx: Context): String =
-      new SyntaxFormatter(sc).assemble(args).stripMargin
+      explained(em(args: _*))
   }
 
   implicit class ArrayInterpolator[T <: AnyRef](val arr: Array[T]) extends AnyVal {

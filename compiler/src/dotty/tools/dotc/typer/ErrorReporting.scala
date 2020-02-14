@@ -6,7 +6,8 @@ import ast._
 import core._
 import Types._, ProtoTypes._, Contexts._, Decorators._, Denotations._, Symbols._
 import Implicits._, Flags._
-import util.Positions._
+import util.Spans._
+import util.SourcePosition
 import java.util.regex.Matcher.quoteReplacement
 import reporting.diagnostic.Message
 import reporting.diagnostic.messages._
@@ -15,18 +16,26 @@ object ErrorReporting {
 
   import tpd._
 
-  def errorTree(tree: untpd.Tree, msg: => Message, pos: Position)(implicit ctx: Context): tpd.Tree =
-    tree withType errorType(msg, pos)
+  def errorTree(tree: untpd.Tree, msg: => Message, pos: SourcePosition)(implicit ctx: Context): tpd.Tree =
+    tree.withType(errorType(msg, pos))
 
   def errorTree(tree: untpd.Tree, msg: => Message)(implicit ctx: Context): tpd.Tree =
-    errorTree(tree, msg, tree.pos)
+    errorTree(tree, msg, tree.sourcePos)
 
-  def errorType(msg: => Message, pos: Position)(implicit ctx: Context): ErrorType = {
+  def errorTree(tree: untpd.Tree, msg: TypeError, pos: SourcePosition)(implicit ctx: Context): tpd.Tree =
+    tree.withType(errorType(msg, pos))
+
+  def errorType(msg: => Message, pos: SourcePosition)(implicit ctx: Context): ErrorType = {
     ctx.error(msg, pos)
     ErrorType(msg)
   }
 
-  def wrongNumberOfTypeArgs(fntpe: Type, expectedArgs: List[ParamInfo], actual: List[untpd.Tree], pos: Position)(implicit ctx: Context): ErrorType =
+  def errorType(ex: TypeError, pos: SourcePosition)(implicit ctx: Context): ErrorType = {
+    ctx.error(ex, pos)
+    ErrorType(ex.toMessage)
+  }
+
+  def wrongNumberOfTypeArgs(fntpe: Type, expectedArgs: List[ParamInfo], actual: List[untpd.Tree], pos: SourcePosition)(implicit ctx: Context): ErrorType =
     errorType(WrongNumberOfTypeArgs(fntpe, expectedArgs, actual)(ctx), pos)
 
   class Errors(implicit ctx: Context) {
@@ -40,24 +49,24 @@ object ErrorReporting {
 
     def expectedTypeStr(tp: Type): String = tp match {
       case tp: PolyProto =>
-        em"type arguments [${tp.targs}%, %] and ${expectedTypeStr(tp.resultType)}"
+        em"type arguments [${tp.targs.tpes}%, %] and ${expectedTypeStr(tp.resultType)}"
       case tp: FunProto =>
         val result = tp.resultType match {
           case _: WildcardType | _: IgnoredProto => ""
           case tp => em" and expected result type $tp"
         }
-        em"arguments (${tp.typedArgs.tpes}%, %)$result"
+        em"arguments (${tp.typedArgs().tpes}%, %)$result"
       case _ =>
         em"expected type $tp"
     }
 
     def anonymousTypeMemberStr(tpe: Type): String = {
       val kind = tpe match {
-          case _: TypeBounds => "type with bounds"
-          case _: MethodOrPoly => "method"
-          case _ => "value of type"
-        }
-        em"$kind $tpe"
+        case _: TypeBounds => "type with bounds"
+        case _: MethodOrPoly => "method"
+        case _ => "value of type"
+      }
+      em"$kind $tpe"
     }
 
     def overloadedAltsStr(alts: List[SingleDenotation]): String =
@@ -79,8 +88,9 @@ object ErrorReporting {
     def takesNoParamsStr(tree: Tree, kind: String): String =
       if (tree.tpe.widen.exists)
         i"${exprStr(tree)} does not take ${kind}parameters"
-      else
+      else {
         i"undefined: $tree # ${tree.uniqueId}: ${tree.tpe.toString} at ${ctx.phase}"
+      }
 
     def patternConstrStr(tree: Tree): String = ???
 
@@ -108,7 +118,7 @@ object ErrorReporting {
       else if (ctx.settings.explainTypes.value)
         i"""
            |${ctx.typerState.constraint}
-           |${TypeComparer.explained((found <:< expected)(_))}"""
+           |${TypeComparer.explained(found <:< expected)}"""
       else
         ""
     }
@@ -125,8 +135,8 @@ object ErrorReporting {
           case tp: TypeParamRef =>
             constraint.entry(tp) match {
               case bounds: TypeBounds =>
-                if (variance < 0) apply(constraint.fullUpperBound(tp))
-                else if (variance > 0) apply(constraint.fullLowerBound(tp))
+                if (variance < 0) apply(ctx.typeComparer.fullUpperBound(tp))
+                else if (variance > 0) apply(ctx.typeComparer.fullLowerBound(tp))
                 else tp
               case NoType => tp
               case instType => apply(instType)
@@ -140,7 +150,15 @@ object ErrorReporting {
       val expected1 = reported(expected)
       val (found2, expected2) =
         if (found1 frozen_<:< expected1) (found, expected) else (found1, expected1)
-      TypeMismatch(found2, expected2, whyNoMatchStr(found, expected), postScript)
+      val postScript1 =
+        if !postScript.isEmpty
+           || expected.isAny
+           || expected.isAnyRef
+           || expected.isRef(defn.AnyValClass)
+           || defn.isBottomType(found)
+        then postScript
+        else ctx.typer.importSuggestionAddendum(ViewProto(found.widen, expected))
+      TypeMismatch(found2, expected2, whyNoMatchStr(found, expected), postScript1)
     }
 
     /** Format `raw` implicitNotFound or implicitAmbiguous argument, replacing
@@ -149,11 +167,16 @@ object ErrorReporting {
      */
     def userDefinedErrorString(raw: String, paramNames: List[String], args: List[Type]): String = {
       def translate(name: String): Option[String] = {
+        assert(paramNames.length == args.length)
         val idx = paramNames.indexOf(name)
         if (idx >= 0) Some(quoteReplacement(ex"${args(idx)}")) else None
       }
       """\$\{\w*\}""".r.replaceSomeIn(raw, m => translate(m.matched.drop(2).init))
     }
+
+    def rewriteNotice: String =
+      if (ctx.scala2CompatMode) "\nThis patch can be inserted automatically under -rewrite."
+      else ""
   }
 
   def err(implicit ctx: Context): Errors = new Errors

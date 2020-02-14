@@ -8,9 +8,9 @@ import java.io.{ File => JFile, OutputStreamWriter, BufferedWriter, ByteArrayInp
 import java.util.{ List => JList, Arrays }
 import java.nio.file.Path
 import java.nio.charset.StandardCharsets
+import java.io.File.{ separator => sep }
 
-import com.vladsch.flexmark.parser.ParserEmulationProfile
-import com.vladsch.flexmark.parser.Parser
+import com.vladsch.flexmark.parser.{ Parser, ParserEmulationProfile }
 import com.vladsch.flexmark.ext.gfm.tables.TablesExtension
 import com.vladsch.flexmark.ext.gfm.strikethrough.StrikethroughExtension
 import com.vladsch.flexmark.ext.gfm.tasklist.TaskListExtension
@@ -18,6 +18,7 @@ import com.vladsch.flexmark.ext.emoji.EmojiExtension
 import com.vladsch.flexmark.ext.autolink.AutolinkExtension
 import com.vladsch.flexmark.ext.anchorlink.AnchorLinkExtension
 import com.vladsch.flexmark.ext.yaml.front.matter.YamlFrontMatterExtension
+import com.vladsch.flexmark.html.HtmlRenderer
 import com.vladsch.flexmark.util.options.{ DataHolder, MutableDataSet }
 
 import dotc.core.Contexts.Context
@@ -30,10 +31,13 @@ import util.syntax._
 
 case class Site(
   root: JFile,
+  outDir: JFile,
   projectTitle: String,
   projectVersion: String,
-  projectUrl: String,
-  documentation: Map[String, Package]
+  projectUrl: Option[String],
+  projectLogo: Option[String],
+  documentation: Map[String, Package],
+  baseUrl: String
 ) extends ResourceFinder {
   /** Documentation serialized to java maps */
   private val docs: JList[_] = {
@@ -99,7 +103,7 @@ case class Site(
         .flatMap { file =>
           val BlogPost.extract(year, month, day, name, ext) = file.getName
           val sourceFile = toSourceFile(file)
-          val params = defaultParams(file, 2).withUrl(s"/blog/$year/$month/$day/$name.html").toMap
+          val params = defaultParams(file).withUrl(s"/blog/$year/$month/$day/$name.html").toMap
           val page =
             if (ext == "md")
               new MarkdownPage(file.getPath, sourceFile, params, includes, documentation)
@@ -126,9 +130,8 @@ case class Site(
     new SourceFile(virtualFile, Codec.UTF8)
   }
 
-  /** Copy static files to `outDir` */
-  def copyStaticFiles(outDir: JFile = new JFile(root.getAbsolutePath + "/_site"))(implicit ctx: Context): this.type =
-    createOutput (outDir) {
+  def copyStaticFiles()(implicit ctx: Context): this.type =
+    createOutput {
       // Copy user-defined static assets
       staticAssets.foreach { asset =>
         val target = mkdirs(fs.getPath(outDir.getAbsolutePath, stripRoot(asset)))
@@ -141,18 +144,22 @@ case class Site(
         "css/toolbar.css" -> "/css/toolbar.css",
         "css/search.css" -> "/css/search.css",
         "css/sidebar.css" -> "/css/sidebar.css",
-        "css/api-page.css" -> "/css/api-page.css",
         "css/dottydoc.css" -> "/css/dottydoc.css",
         "css/color-brewer.css" -> "/css/color-brewer.css",
-        "css/font-awesome.min.css" -> "/css/font-awesome.min.css",
         "css/bootstrap.min.css" -> "/css/bootstrap.min.css",
+        "js/toolbar.js" -> "/js/toolbar.js",
+        "js/sidebar.js" -> "/js/sidebar.js",
+        "js/dottydoc.js" -> "/js/dottydoc.js",
         "js/api-search.js" -> "/js/api-search.js",
         "js/bootstrap.min.js" -> "/js/bootstrap.min.js",
         "js/jquery.min.js" -> "/js/jquery.min.js",
-        "js/tether.min.js" -> "/js/tether.min.js",
-        "js/highlight.pack.js" -> "/js/highlight.pack.js"
+        "js/highlight.pack.js" -> "/js/highlight.pack.js",
+        "images/dotty-logo.svg" -> "/images/dotty-logo.svg",
+        "images/scala-logo.svg" -> "/images/scala-logo.svg",
+        "images/dotty-logo-white.svg" -> "/images/dotty-logo-white.svg",
+        "images/scala-logo-white.svg" -> "/images/scala-logo-white.svg"
       )
-      .mapValues(getResource)
+      .transform((_, v) => getResource(v))
       .foreach { case (path, resource) =>
         val source = new ByteArrayInputStream(resource.getBytes(StandardCharsets.UTF_8))
         val target = mkdirs(fs.getPath(outDir.getAbsolutePath, path))
@@ -161,26 +168,19 @@ case class Site(
     }
 
   /** Generate default params included in each page */
-  private def defaultParams(pageLocation: JFile, additionalDepth: Int = 0): DefaultParams = {
+  private def defaultParams(pageLocation: JFile): DefaultParams =
     val pathFromRoot = stripRoot(pageLocation)
-    val baseUrl: String = {
-      val rootLen = root.getAbsolutePath.split('/').length
-      val assetLen = pageLocation.getAbsolutePath.split('/').length
-      "../" * (assetLen - rootLen - 1 + additionalDepth) + "."
-    }
-
     DefaultParams(
       docs, docsFlattened, documentation, PageInfo(pathFromRoot),
       SiteInfo(
-        baseUrl, projectTitle, projectVersion, projectUrl, Array(),
+        baseUrl, projectTitle, projectVersion, projectUrl, projectLogo, Array(),
         root.toString
       ),
       sidebar
     )
-  }
 
   /* Creates output directories if allowed */
-  private def createOutput(outDir: JFile)(op: => Unit)(implicit ctx: Context): this.type = {
+  private def createOutput(op: => Unit)(implicit ctx: Context): this.type = {
     if (!outDir.isDirectory) outDir.mkdirs()
     if (!outDir.isDirectory) ctx.docbase.error(s"couldn't create output folder: $outDir")
     else op
@@ -188,19 +188,23 @@ case class Site(
   }
 
   /** Generate HTML for the API documentation */
-  def generateApiDocs(outDir: JFile = new JFile(root.getAbsolutePath + "/_site"))(implicit ctx: Context): this.type =
-    createOutput(outDir) {
+  def generateApiDocs()(implicit ctx: Context): this.type =
+    createOutput {
       def genDoc(e: model.Entity): Unit = {
         ctx.docbase.echo(s"Generating doc page for: ${e.path.mkString(".")}")
         // Suffix is index.html for packages and therefore the additional depth
         // is increased by 1
         val (suffix, offset) =
-          if (e.kind == "package") ("/index.html", -1)
+          if (e.kind == "package") (sep + "index.html", -1)
           else (".html", 0)
 
-        val target = mkdirs(fs.getPath(outDir.getAbsolutePath +  "/api/" + e.path.mkString("/") + suffix))
-        val params = defaultParams(target.toFile, -1).withPosts(blogInfo).withEntity(Some(e)).toMap
-        val page = new HtmlPage("_layouts/api-page.html", layouts("api-page").content, params, includes)
+        val path = if (scala.util.Properties.isWin)
+          e.path.map(_.replace("<", "_").replace(">", "_"))
+        else
+          e.path
+        val target = mkdirs(fs.getPath(outDir.getAbsolutePath +  sep + "api" + sep + path.mkString(sep) + suffix))
+        val params = defaultParams(target.toFile).withPosts(blogInfo).withEntity(Some(e)).toMap
+        val page = new HtmlPage("_layouts" + sep + "api-page.html", layouts("api-page").content, params, includes)
 
         render(page).foreach { rendered =>
           val source = new ByteArrayInputStream(rendered.getBytes(StandardCharsets.UTF_8))
@@ -217,9 +221,9 @@ case class Site(
       }
 
       // generate search page:
-      val target = mkdirs(fs.getPath(outDir.getAbsolutePath +  "/api/search.html"))
-      val searchPageParams = defaultParams(target.toFile, -1).withPosts(blogInfo).toMap
-      val searchPage = new HtmlPage("_layouts/search.html", layouts("search").content, searchPageParams, includes)
+      val target = mkdirs(fs.getPath(outDir.getAbsolutePath + sep + "api" + sep + "search.html"))
+      val searchPageParams = defaultParams(target.toFile).withPosts(blogInfo).toMap
+      val searchPage = new HtmlPage("_layouts" + sep + "search.html", layouts("search").content, searchPageParams, includes)
       render(searchPage).foreach { rendered =>
         Files.copy(
           new ByteArrayInputStream(rendered.getBytes(StandardCharsets.UTF_8)),
@@ -230,8 +234,8 @@ case class Site(
     }
 
   /** Generate HTML files from markdown and .html sources */
-  def generateHtmlFiles(outDir: JFile = new JFile(root.getAbsolutePath + "/_site"))(implicit ctx: Context): this.type =
-    createOutput(outDir) {
+  def generateHtmlFiles()(implicit ctx: Context): this.type =
+    createOutput {
       compilableFiles.foreach { asset =>
         val pathFromRoot = stripRoot(asset)
         val sourceFile = toSourceFile(asset)
@@ -250,13 +254,13 @@ case class Site(
     }
 
   /** Generate blog from files in `blog/_posts` and output in `outDir` */
-  def generateBlog(outDir: JFile = new JFile(root.getAbsolutePath + "/_site"))(implicit ctx: Context): this.type =
-    createOutput(outDir) {
+  def generateBlog()(implicit ctx: Context): this.type =
+    createOutput {
       blogposts.foreach { file =>
         val BlogPost.extract(year, month, day, name, ext) = file.getName
         val sourceFile = toSourceFile(file)
         val date = s"$year-$month-$day 00:00:00"
-        val params = defaultParams(file, 2).withPosts(blogInfo).withDate(date).toMap
+        val params = defaultParams(file).withPosts(blogInfo).withDate(date).toMap
 
         // Output target
         val target = mkdirs(fs.getPath(outDir.getAbsolutePath, "blog", year, month, day, name + ".html"))
@@ -358,6 +362,7 @@ case class Site(
       .toMap
 
     val defaultLayouts: Map[String, Layout] = Map(
+      "base" -> "/_layouts/base.html",
       "main" -> "/_layouts/main.html",
       "search" -> "/_layouts/search.html",
       "doc-page" -> "/_layouts/doc-page.html",
@@ -396,7 +401,6 @@ case class Site(
 
     val defaultIncludes: Map[String, Include] = Map(
       "header.html" -> "/_includes/header.html",
-      "scala-logo.svg" -> "/_includes/scala-logo.svg",
       "toolbar.html" -> "/_includes/toolbar.html",
       "sidebar.html" -> "/_includes/sidebar.html"
     ).map {
@@ -408,7 +412,7 @@ case class Site(
   }
 
   private def toSourceFile(f: JFile): SourceFile =
-    SourceFile(AbstractFile.getFile(new File(f.toPath)), Source.fromFile(f, "UTF-8").toArray)
+    new SourceFile(AbstractFile.getFile(new File(f.toPath)), Source.fromFile(f, "UTF-8").toArray)
 
   private def collectFiles(dir: JFile, includes: String => Boolean): Array[JFile] =
     dir
@@ -433,6 +437,12 @@ object Site {
   val markdownOptions: DataHolder =
     new MutableDataSet()
       .setFrom(ParserEmulationProfile.KRAMDOWN.getOptions)
+      .set(Parser.INDENTED_CODE_BLOCK_PARSER, false)
+      .set(HtmlRenderer.FENCED_CODE_LANGUAGE_CLASS_PREFIX, "")
+      .set(HtmlRenderer.FENCED_CODE_NO_LANGUAGE_CLASS, "nohighlight")
+      .set(AnchorLinkExtension.ANCHORLINKS_WRAP_TEXT, false)
+      .set(AnchorLinkExtension.ANCHORLINKS_ANCHOR_CLASS, "anchor")
+      .set(EmojiExtension.ROOT_IMAGE_PATH, "https://github.global.ssl.fastly.net/images/icons/emoji/")
       .set(Parser.EXTENSIONS, Arrays.asList(
         TablesExtension.create(),
         TaskListExtension.create(),
@@ -442,6 +452,4 @@ object Site {
         YamlFrontMatterExtension.create(),
         StrikethroughExtension.create()
       ))
-      .set(EmojiExtension.ROOT_IMAGE_PATH,
-        "https://github.global.ssl.fastly.net/images/icons/emoji/")
 }

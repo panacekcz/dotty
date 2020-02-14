@@ -10,6 +10,7 @@ import Decorators._
 import util.Stats._
 import Names._
 import NameOps._
+import Variances.variancesConform
 import dotty.tools.dotc.config.Config
 
 object TypeApplications {
@@ -21,24 +22,6 @@ object TypeApplications {
     case tp: TypeBounds => throw new AssertionError("no TypeBounds allowed")
     case _ => tp
   }
-
-  /** Does variance `v1` conform to variance `v2`?
-   *  This is the case if the variances are the same or `sym` is nonvariant.
-   */
-  def varianceConforms(v1: Int, v2: Int): Boolean =
-    v1 == v2 || v2 == 0
-
-  /** Does the variance of type parameter `tparam1` conform to the variance of type parameter `tparam2`?
-   */
-  def varianceConforms(tparam1: TypeParamInfo, tparam2: TypeParamInfo)(implicit ctx: Context): Boolean =
-    varianceConforms(tparam1.paramVariance, tparam2.paramVariance)
-
-  /** Do the variances of type parameters `tparams1` conform to the variances
-   *  of corresponding type parameters `tparams2`?
-   *  This is only the case of `tparams1` and `tparams2` have the same length.
-   */
-  def variancesConform(tparams1: List[TypeParamInfo], tparams2: List[TypeParamInfo])(implicit ctx: Context): Boolean =
-    tparams1.corresponds(tparams2)(varianceConforms)
 
   /** Extractor for
    *
@@ -80,7 +63,7 @@ object TypeApplications {
    *  and there are no other occurrences of `X` in the reduced type. In that case
    *  the refinement above is replaced by
    *
-   *        C[..., _ >: L <: H, ...]
+   *        C[..., ? >: L <: H, ...]
    *
    *  The `allReplaced` field indicates whether all occurrences of type lambda parameters
    *  in the reduced type have been replaced with arguments.
@@ -88,7 +71,7 @@ object TypeApplications {
    *  2. If Mode.AllowLambdaWildcardApply is not set:
    *  All `X` arguments are replaced by:
    *
-   *        _ >: L <: H
+   *        ? >: L <: H
    *
    *  Any other occurrence of `X` in `tycon` is replaced by `U`, if the
    *  occurrence of `X` in `tycon` is covariant, or nonvariant, or by `L`,
@@ -103,10 +86,10 @@ object TypeApplications {
    *  produce a higher-kinded application with a type lambda as type constructor.
    */
   class Reducer(tycon: TypeLambda, args: List[Type])(implicit ctx: Context) extends TypeMap {
-    private[this] var available = (0 until args.length).toSet
+    private var available = (0 until args.length).toSet
     var allReplaced: Boolean = true
     def hasWildcardArg(p: TypeParamRef): Boolean =
-      p.binder == tycon && args(p.paramNum).isInstanceOf[TypeBounds]
+      p.binder == tycon && isBounds(args(p.paramNum))
     def canReduceWildcard(p: TypeParamRef): Boolean =
       !ctx.mode.is(Mode.AllowLambdaWildcardApply) || available.contains(p.paramNum)
     def atNestedLevel(op: => Type): Type = {
@@ -129,6 +112,8 @@ object TypeApplications {
     def apply(t: Type): Type = t match {
       case t @ AppliedType(tycon, args1) if tycon.typeSymbol.isClass =>
         t.derivedAppliedType(apply(tycon), args1.mapConserve(applyArg))
+      case t @ RefinedType(parent, name, TypeAlias(info)) =>
+        t.derivedRefinedType(apply(parent), name, applyArg(info).bounds)
       case p: TypeParamRef if p.binder == tycon =>
         args(p.paramNum) match {
           case TypeBounds(lo, hi) =>
@@ -154,12 +139,11 @@ class TypeApplications(val self: Type) extends AnyVal {
   /** The type parameters of this type are:
    *  For a ClassInfo type, the type parameters of its class.
    *  For a typeref referring to a class, the type parameters of the class.
-   *  For a typeref referring to a Lambda class, the type parameters of
-   *    its right hand side or upper bound.
    *  For a refinement type, the type parameters of its parent, dropping
    *  any type parameter that is-rebound by the refinement.
    */
-  final def typeParams(implicit ctx: Context): List[TypeParamInfo] = /*>|>*/ track("typeParams") /*<|<*/ {
+  final def typeParams(implicit ctx: Context): List[TypeParamInfo] = {
+    record("typeParams")
     def isTrivial(prefix: Type, tycon: Symbol) = prefix match {
       case prefix: ThisType => prefix.cls `eq` tycon.owner
       case NoPrefix => true
@@ -211,7 +195,10 @@ class TypeApplications(val self: Type) extends AnyVal {
 
   /** Is self type of kind "*"? */
   def hasSimpleKind(implicit ctx: Context): Boolean =
-    typeParams.isEmpty && !self.hasAnyKind
+    typeParams.isEmpty && !self.hasAnyKind || {
+      val alias = self.dealias
+      (alias ne self) && alias.hasSimpleKind
+    }
 
   /** If self type is higher-kinded, its result type, otherwise NoType.
    *  Note: The hkResult of an any-kinded type is again AnyKind.
@@ -263,11 +250,9 @@ class TypeApplications(val self: Type) extends AnyVal {
   /** Convert a type constructor `TC` which has type parameters `X1, ..., Xn`
    *  to `[X1, ..., Xn] -> TC[X1, ..., Xn]`.
    */
-  def EtaExpand(tparams: List[TypeSymbol])(implicit ctx: Context): Type = {
-    val tparamsToUse = if (variancesConform(typeParams, tparams)) tparams else typeParamSymbols
-    HKTypeLambda.fromParams(tparamsToUse, self.appliedTo(tparams.map(_.typeRef)))
+  def EtaExpand(tparams: List[TypeParamInfo])(implicit ctx: Context): Type =
+    HKTypeLambda.fromParams(tparams, self.appliedTo(tparams.map(_.paramRef)))
       //.ensuring(res => res.EtaReduce =:= self, s"res = $res, core = ${res.EtaReduce}, self = $self, hc = ${res.hashCode}")
-  }
 
   /** If self is not lambda-bound, eta expand it. */
   def ensureLambdaSub(implicit ctx: Context): Type =
@@ -284,62 +269,6 @@ class TypeApplications(val self: Type) extends AnyVal {
     }
   }
 
-  /** If argument A and type parameter P are higher-kinded, adapt the variances
-   *  of A to those of P, ensuring that the variances of the type lambda A
-   *  agree with the variances of corresponding higher-kinded type parameters of P. Example:
-   *
-   *     class GenericCompanion[+CC[X]]
-   *     GenericCompanion[List]
-   *
-   *  with adaptHkVariances, the argument `List` will expand to
-   *
-   *     [X] => List[X]
-   *
-   *  instead of
-   *
-   *     [+X] => List[X]
-   *
-   *  even though `List` is covariant. This adaptation is necessary to ignore conflicting
-   *  variances in overriding members that have types of hk-type parameters such as
-   *  `GenericCompanion[GenTraversable]` or `GenericCompanion[ListBuffer]`.
-   *  When checking overriding, we need to validate the subtype relationship
-   *
-   *      GenericCompanion[[X] -> ListBuffer[X]] <: GenericCompanion[[+X] -> GenTraversable[X]]
-   *
-   *   Without adaptation, this would be false, and hence an overriding error would
-   *   result. But with adaptation, the rhs argument will be adapted to
-   *
-   *     [X] -> GenTraversable[X]
-   *
-   *   which makes the subtype test succeed. The crucial point here is that, since
-   *   GenericCompanion only expects a non-variant CC, the fact that GenTraversable
-   *   is covariant is irrelevant, so can be ignored.
-   */
-  def adaptHkVariances(bound: Type)(implicit ctx: Context): Type = {
-    val hkParams = bound.hkTypeParams
-    if (hkParams.isEmpty) self
-    else {
-      def adaptArg(arg: Type): Type = arg match {
-        case arg @ HKTypeLambda(tparams, body) if
-             !tparams.corresponds(hkParams)(_.paramVariance == _.paramVariance) &&
-             tparams.corresponds(hkParams)(varianceConforms) =>
-          HKTypeLambda(
-            (tparams, hkParams).zipped.map((tparam, hkparam) =>
-              tparam.paramName.withVariance(hkparam.paramVariance)))(
-            tl => arg.paramInfos.map(_.subst(arg, tl).bounds),
-            tl => arg.resultType.subst(arg, tl)
-          )
-        case arg: AliasingBounds =>
-          arg.derivedAlias(adaptArg(arg.alias))
-        case arg @ TypeBounds(lo, hi) =>
-          arg.derivedTypeBounds(adaptArg(lo), adaptArg(hi))
-        case _ =>
-          arg
-      }
-      adaptArg(self)
-    }
-  }
-
   /** The type representing
    *
    *     T[U1, ..., Un]
@@ -348,7 +277,8 @@ class TypeApplications(val self: Type) extends AnyVal {
    *  @param  self   = `T`
    *  @param  args   = `U1,...,Un`
    */
-  final def appliedTo(args: List[Type])(implicit ctx: Context): Type = /*>|>*/ track("appliedTo") /*<|<*/ {
+  final def appliedTo(args: List[Type])(implicit ctx: Context): Type = {
+    record("appliedTo")
     val typParams = self.typeParams
     val stripped = self.stripTypeVar
     val dealiased = stripped.safeDealias
@@ -356,7 +286,7 @@ class TypeApplications(val self: Type) extends AnyVal {
     else dealiased match {
       case dealiased: HKTypeLambda =>
         def tryReduce =
-          if (!args.exists(_.isInstanceOf[TypeBounds])) {
+          if (!args.exists(isBounds)) {
             val followAlias = Config.simplifyApplications && {
               dealiased.resType match {
                 case AppliedType(tyconBody, dealiasedArgs) =>
@@ -364,12 +294,16 @@ class TypeApplications(val self: Type) extends AnyVal {
                   // just eta-reduction (ignoring variance annotations).
                   // See i2201*.scala for examples where more aggressive
                   // reduction would break type inference.
-                  dealiased.paramRefs == dealiasedArgs
+                  dealiased.paramRefs == dealiasedArgs ||
+                  defn.isCompiletimeAppliedType(tyconBody.typeSymbol)
                 case _ => false
               }
             }
             if ((dealiased eq stripped) || followAlias)
-              try dealiased.instantiate(args)
+              try {
+                val instantiated = dealiased.instantiate(args)
+                if (followAlias) instantiated.normalized else instantiated
+              }
               catch { case ex: IndexOutOfBoundsException => AppliedType(self, args) }
             else AppliedType(self, args)
           }
@@ -400,7 +334,7 @@ class TypeApplications(val self: Type) extends AnyVal {
       case dealiased: LazyRef =>
         LazyRef(c => dealiased.ref(c).appliedTo(args))
       case dealiased: WildcardType =>
-        WildcardType(dealiased.optBounds.appliedTo(args).bounds)
+        WildcardType(dealiased.optBounds.orElse(TypeBounds.empty).appliedTo(args).bounds)
       case dealiased: TypeRef if dealiased.symbol == defn.NothingClass =>
         dealiased
       case dealiased =>
@@ -427,7 +361,7 @@ class TypeApplications(val self: Type) extends AnyVal {
   }
 
   /** Turns non-bounds types to type bounds.
-   *  A (possible lambda abstracted) match type is turned into an abstract type.
+   *  A (possible lambda abstracted) match type is turned into a match alias.
    *  Every other type is turned into a type alias
    */
   final def toBounds(implicit ctx: Context): TypeBounds = self match {
@@ -435,7 +369,7 @@ class TypeApplications(val self: Type) extends AnyVal {
     case _ => if (self.isMatch) MatchAlias(self) else TypeAlias(self)
   }
 
-  /** Translate a type of the form From[T] to either To[T] or To[_ <: T] (if `wildcardArg` is set). Keep other types as they are.
+  /** Translate a type of the form From[T] to either To[T] or To[? <: T] (if `wildcardArg` is set). Keep other types as they are.
    *  `from` and `to` must be static classes, both with one type parameter, and the same variance.
    *  Do the same for by name types => From[T] and => To[T]
    */
@@ -444,7 +378,10 @@ class TypeApplications(val self: Type) extends AnyVal {
       self.derivedExprType(tp.translateParameterized(from, to))
     case _ =>
       if (self.derivesFrom(from)) {
-        val arg = self.baseType(from).argInfos.head
+        def elemType(tp: Type): Type = tp match
+          case tp: AndOrType => tp.derivedAndOrType(elemType(tp.tp1), elemType(tp.tp2))
+          case _ => tp.baseType(from).argInfos.head
+        val arg = elemType(self)
         val arg1 = if (wildcardArg) TypeBounds.upper(arg) else arg
         to.typeRef.appliedTo(arg1)
       }
@@ -457,7 +394,7 @@ class TypeApplications(val self: Type) extends AnyVal {
   def underlyingIfRepeated(isJava: Boolean)(implicit ctx: Context): Type =
     if (self.isRepeatedParam) {
       val seqClass = if (isJava) defn.ArrayClass else defn.SeqClass
-      // If `isJava` is set, then we want to turn `RepeatedParam[T]` into `Array[_ <: T]`,
+      // If `isJava` is set, then we want to turn `RepeatedParam[T]` into `Array[? <: T]`,
       // since arrays aren't covariant until after erasure. See `tests/pos/i5140`.
       translateParameterized(defn.RepeatedParamClass, seqClass, wildcardArg = isJava)
     }
@@ -497,7 +434,7 @@ class TypeApplications(val self: Type) extends AnyVal {
   }
 
   /** The element type of a sequence or array */
-  def elemType(implicit ctx: Context): Type = self match {
+  def elemType(implicit ctx: Context): Type = self.widenDealias match {
     case defn.ArrayOf(elemtp) => elemtp
     case JavaArrayType(elemtp) => elemtp
     case _ => self.baseType(defn.SeqClass).argInfos.headOption.getOrElse(NoType)

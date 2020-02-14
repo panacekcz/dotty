@@ -6,13 +6,17 @@ import core._
 import ast._
 import Contexts._, Constants._, Types._, Symbols._, Names._, Flags._, Decorators._
 import ErrorReporting._, Annotations._, Denotations._, SymDenotations._, StdNames._
-import util.Positions._
+import util.Spans._
+import util.SourcePosition
 import config.Printers.typr
 import ast.Trees._
 import NameOps._
+import ProtoTypes._
 import collection.mutable
 import reporting.diagnostic.messages._
-import Checking.checkNoPrivateLeaks
+import Checking.{checkNoPrivateLeaks, checkNoWildcard}
+
+import scala.annotation.threadUnsafe
 
 trait TypeAssigner {
   import tpd._
@@ -27,12 +31,12 @@ trait TypeAssigner {
           sym.name == qual ||
           sym.is(Module) && sym.name.stripModuleClassSuffix == qual)
     ctx.outersIterator.map(_.owner).find(qualifies) match {
-      case Some(c) if packageOK || !(c is Package) =>
+      case Some(c) if packageOK || !c.is(Package) =>
         c
       case _ =>
         ctx.error(
           if (qual.isEmpty) tree.show + " can be used only in a class, object, or template"
-          else qual.show + " is not an enclosing class", tree.pos)
+          else qual.show + " is not an enclosing class", tree.sourcePos)
         NoSymbol
     }
   }
@@ -49,23 +53,31 @@ trait TypeAssigner {
 
     def addRefinement(parent: Type, decl: Symbol) = {
       val inherited =
-        parentType.findMember(decl.name, cls.thisType, excluded = Private)
-          .suchThat(decl.matches(_))
+        parentType.findMember(decl.name, cls.thisType,
+          required = EmptyFlags, excluded = Private
+        ).suchThat(decl.matches(_))
       val inheritedInfo = inherited.info
-      if (inheritedInfo.exists && decl.info <:< inheritedInfo && !(inheritedInfo <:< decl.info)) {
+      val isPolyFunctionApply = decl.name == nme.apply && (parent <:< defn.PolyFunctionType)
+      if isPolyFunctionApply
+         || inheritedInfo.exists
+            && !decl.isClass
+            && decl.info.widenExpr <:< inheritedInfo.widenExpr
+            && !(inheritedInfo.widenExpr <:< decl.info.widenExpr)
+      then
         val r = RefinedType(parent, decl.name, decl.info)
         typr.println(i"add ref $parent $decl --> " + r)
         r
-      }
       else
         parent
     }
 
-    def close(tp: Type) = RecType.closeOver(rt => tp.substThis(cls, rt.recThis))
+    def close(tp: Type) = RecType.closeOver { rt =>
+      tp.subst(cls :: Nil, rt.recThis :: Nil).substThis(cls, rt.recThis)
+    }
 
     def isRefinable(sym: Symbol) = !sym.is(Private) && !sym.isConstructor
     val refinableDecls = info.decls.filter(isRefinable)
-    val raw = (parentType /: refinableDecls)(addRefinement)
+    val raw = refinableDecls.foldLeft(parentType)(addRefinement)
     HKTypeLambda.fromParams(cls.typeParams, raw) match {
       case tl: HKTypeLambda => tl.derivedLambdaType(resType = close(tl.resType))
       case tp => close(tp)
@@ -86,7 +98,7 @@ trait TypeAssigner {
    */
   def avoid(tp: Type, symsToAvoid: => List[Symbol])(implicit ctx: Context): Type = {
     val widenMap = new ApproximatingTypeMap {
-      lazy val forbidden = symsToAvoid.toSet
+      @threadUnsafe lazy val forbidden = symsToAvoid.toSet
       def toAvoid(sym: Symbol) = !sym.isStatic && forbidden.contains(sym)
       def partsToAvoid = new NamedPartsAccumulator(tp => toAvoid(tp.symbol))
       def apply(tp: Type): Type = tp match {
@@ -105,7 +117,7 @@ trait TypeAssigner {
             case info: ClassInfo =>
               range(defn.NothingType, apply(classBound(info)))
             case _ =>
-              range(defn.NothingType, defn.AnyType) // should happen only in error cases
+              emptyRange // should happen only in error cases
           }
         case tp: ThisType if toAvoid(tp.cls) =>
           range(defn.NothingType, apply(classBound(tp.cls.classInfo)))
@@ -148,18 +160,23 @@ trait TypeAssigner {
   def avoidingType(expr: Tree, bindings: List[Tree])(implicit ctx: Context): Type =
     avoid(expr.tpe, localSyms(bindings).filter(_.isTerm))
 
-  def avoidPrivateLeaks(sym: Symbol, pos: Position)(implicit ctx: Context): Type =
-    if (!sym.is(SyntheticOrPrivate) && sym.owner.isClass) checkNoPrivateLeaks(sym, pos)
+  def avoidPrivateLeaks(sym: Symbol)(implicit ctx: Context): Type =
+    if sym.owner.isClass && !sym.isOneOf(JavaOrPrivateOrSynthetic)
+    then checkNoPrivateLeaks(sym)
     else sym.info
 
-  def seqToRepeated(tree: Tree)(implicit ctx: Context): Tree =
-    Typed(tree, TypeTree(tree.tpe.widen.translateParameterized(defn.SeqClass, defn.RepeatedParamClass)))
+  private def toRepeated(tree: Tree, from: ClassSymbol)(implicit ctx: Context): Tree =
+    Typed(tree, TypeTree(tree.tpe.widen.translateParameterized(from, defn.RepeatedParamClass)))
+
+  def seqToRepeated(tree: Tree)(implicit ctx: Context): Tree = toRepeated(tree, defn.SeqClass)
+
+  def arrayToRepeated(tree: Tree)(implicit ctx: Context): Tree = toRepeated(tree, defn.ArrayClass)
 
   /** A denotation exists really if it exists and does not point to a stale symbol. */
   final def reallyExists(denot: Denotation)(implicit ctx: Context): Boolean = try
     denot match {
       case denot: SymDenotation =>
-        denot.exists && !denot.isAbsent
+        denot.exists && !denot.isAbsent()
       case denot: SingleDenotation =>
         val sym = denot.symbol
         (sym eq NoSymbol) || reallyExists(sym.denot)
@@ -179,7 +196,7 @@ trait TypeAssigner {
    *  (2) if the owner of the denotation is a package object, it is assured
    *      that the package object shows up as the prefix.
    */
-  def ensureAccessible(tpe: Type, superAccess: Boolean, pos: Position)(implicit ctx: Context): Type = {
+  def ensureAccessible(tpe: Type, superAccess: Boolean, pos: SourcePosition)(implicit ctx: Context): Type = {
     def test(tpe: Type, firstTry: Boolean): Type = tpe match {
       case tpe: NamedType =>
         val pre = tpe.prefix
@@ -191,34 +208,24 @@ trait TypeAssigner {
           val d2 = pre.nonPrivateMember(name)
           if (reallyExists(d2) && firstTry)
             test(NamedType(pre, name, d2), false)
-          else if (pre.derivesFrom(defn.DynamicClass)) {
+          else if (pre.derivesFrom(defn.DynamicClass) && name.isTermName)
             TryDynamicCallType
-          } else {
+          else {
             val alts = tpe.denot.alternatives.map(_.symbol).filter(_.exists)
             var packageAccess = false
             val what = alts match {
               case Nil =>
-                i"$name cannot be accessed as a member of $pre"
+                name.toString
               case sym :: Nil =>
-                if (sym.owner.is(Package)) {
-                  packageAccess = true
-                  i"${sym.showLocated} cannot be accessed"
-                }
-                else {
-                  val symStr = if (sym.owner == pre.typeSymbol) sym.show else sym.showLocated
-                  i"$symStr cannot be accessed as a member of $pre"
-                }
+                if (sym.owner == pre.typeSymbol) sym.show else sym.showLocated
               case _ =>
-                em"none of the overloaded alternatives named $name can be accessed as members of $pre"
+                em"none of the overloaded alternatives named $name"
             }
-            val where =
-              if (!ctx.owner.exists) ""
-              else if (packageAccess) i" from nested ${ctx.owner.enclosingPackageClass}"
-              else i" from ${ctx.owner.enclosingClass}"
+            val where = if (ctx.owner.exists) s" from ${ctx.owner.enclosingClass}" else ""
             val whyNot = new StringBuffer
             alts foreach (_.isAccessibleFrom(pre, superAccess, whyNot))
             if (tpe.isError) tpe
-            else errorType(ex"$what$where.$whyNot", pos)
+            else errorType(ex"$what cannot be accessed as a member of $pre$where.$whyNot", pos)
           }
         }
         else ctx.makePackageObjPrefixExplicit(tpe withDenot d)
@@ -228,39 +235,75 @@ trait TypeAssigner {
     test(tpe, true)
   }
 
-  /** The type of a selection with `name` of a tree with type `site`.
+  /** Return a potentially skolemized version of `qualTpe` to be used
+   *  as a prefix when selecting `name`.
+   *
+   *  @see QualSkolemType, TypeOps#asSeenFrom
    */
-  def selectionType(site: Type, name: Name, pos: Position)(implicit ctx: Context): Type = {
-    val mbr = site.member(name)
-    if (reallyExists(mbr))
-      site.select(name, mbr)
-    else if (site.derivesFrom(defn.DynamicClass) && !Dynamic.isDynamicMethod(name))
-      TryDynamicCallType
-    else if (site.isErroneous || name.toTermName == nme.ERROR)
-      UnspecifiedErrorType
-    else {
-      def kind = if (name.isTypeName) "type" else "value"
-      def addendum =
-        if (site.derivesFrom(defn.DynamicClass)) "\npossible cause: maybe a wrong Dynamic method signature?"
-        else ""
-      errorType(
-        if (name == nme.CONSTRUCTOR) ex"$site does not have a constructor"
-        else NotAMember(site, name, kind),
-        pos)
-    }
-  }
+  def maybeSkolemizePrefix(qualType: Type, name: Name)(implicit ctx: Context): Type =
+    if (name.isTermName && !ctx.isLegalPrefix(qualType))
+      QualSkolemType(qualType)
+    else
+      qualType
 
-  /** The selection type, which is additionally checked for accessibility.
-   */
-  def accessibleSelectionType(tree: untpd.RefTree, qual1: Tree)(implicit ctx: Context): Type = {
+  /** The type of the selection `tree`, where `qual1` is the typed qualifier part. */
+  def selectionType(tree: untpd.RefTree, qual1: Tree)(implicit ctx: Context): Type = {
     var qualType = qual1.tpe.widenIfUnstable
     if (!qualType.hasSimpleKind && tree.name != nme.CONSTRUCTOR)
       // constructors are selected on typeconstructor, type arguments are passed afterwards
-      qualType = errorType(em"$qualType takes type parameters", qual1.pos)
-    else if (!qualType.isInstanceOf[TermType]) qualType = errorType(em"$qualType is illegal as a selection prefix", qual1.pos)
-    val ownType = selectionType(qualType, tree.name, tree.pos)
-    if (tree.getAttachment(desugar.SuppressAccessCheck).isDefined) ownType
-    else ensureAccessible(ownType, qual1.isInstanceOf[Super], tree.pos)
+      qualType = errorType(em"$qualType takes type parameters", qual1.sourcePos)
+    else if (!qualType.isInstanceOf[TermType])
+      qualType = errorType(em"$qualType is illegal as a selection prefix", qual1.sourcePos)
+
+    val name = tree.name
+    val pre = maybeSkolemizePrefix(qualType, name)
+    val mbr = qualType.findMember(name, pre)
+    if (reallyExists(mbr))
+      qualType.select(name, mbr)
+    else if (qualType.derivesFrom(defn.DynamicClass) && name.isTermName && !Dynamic.isDynamicMethod(name))
+      TryDynamicCallType
+    else if (qualType.isErroneous || name.toTermName == nme.ERROR)
+      UnspecifiedErrorType
+    else if (name == nme.CONSTRUCTOR)
+      errorType(ex"$qualType does not have a constructor", tree.sourcePos)
+    else {
+      val kind = if (name.isTypeName) "type" else "value"
+      def addendum =
+        if (qualType.derivesFrom(defn.DynamicClass))
+          "\npossible cause: maybe a wrong Dynamic method signature?"
+        else qual1.getAttachment(Typer.HiddenSearchFailure) match
+          case Some(failure) if !failure.reason.isInstanceOf[Implicits.NoMatchingImplicits] =>
+            i""".
+              |An extension method was tried, but could not be fully constructed:
+              |
+              |    ${failure.tree.show.replace("\n", "\n    ")}"""
+          case _ =>
+            if (tree.hasAttachment(desugar.MultiLineInfix))
+              i""".
+                 |Note that `$name` is treated as an infix operator in Scala 3.
+                 |If you do not want that, insert a `;` or empty line in front
+                 |or drop any spaces behind the operator."""
+            else if qualType.isBottomType then ""
+            else
+              var add = importSuggestionAddendum(
+                ViewProto(qualType.widen,
+                  SelectionProto(name, WildcardType, NoViewsAllowed, privateOK = false)))
+              if add.isEmpty then ""
+              else ", but could be made available as an extension method." ++ add
+      end addendum
+      errorType(NotAMember(qualType, name, kind, addendum), tree.sourcePos)
+    }
+  }
+
+  def importSuggestionAddendum(pt: Type)(using Context): String = ""
+
+  /** The type of the selection in `tree`, where `qual1` is the typed qualifier part.
+   *  The selection type is additionally checked for accessibility.
+   */
+  def accessibleSelectionType(tree: untpd.RefTree, qual1: Tree)(implicit ctx: Context): Type = {
+    val ownType = selectionType(tree, qual1)
+    if (tree.hasAttachment(desugar.SuppressAccessCheck)) ownType
+    else ensureAccessible(ownType, qual1.isInstanceOf[Super], tree.sourcePos)
   }
 
   /** Type assignment method. Each method takes as parameters
@@ -274,8 +317,12 @@ trait TypeAssigner {
   def assignType(tree: untpd.Select, qual: Tree)(implicit ctx: Context): Select = {
     def qualType = qual.tpe.widen
     def arrayElemType = {
-      val JavaArrayType(elemtp) = qualType
-      elemtp
+      qualType match {
+        case JavaArrayType(elemtp) => elemtp
+        case _ =>
+          ctx.error("Expected Array but was " + qualType.show, tree.sourcePos)
+          defn.NothingType
+      }
     }
     val p = nme.primitive
     val tp = tree.name match {
@@ -294,8 +341,16 @@ trait TypeAssigner {
     ConstFold(tree.withType(tp))
   }
 
+  /** Normalize type T appearing in a new T by following eta expansions to
+   *  avoid higher-kinded types.
+   */
+  def typeOfNew(tpt: Tree)(implicit ctx: Context): Type = tpt.tpe.dealias match {
+    case TypeApplications.EtaExpansion(tycon) => tycon
+    case t => tpt.tpe
+  }
+
   def assignType(tree: untpd.New, tpt: Tree)(implicit ctx: Context): New =
-    tree.withType(tpt.tpe)
+    tree.withType(typeOfNew(tpt))
 
   def assignType(tree: untpd.Literal)(implicit ctx: Context): Literal =
     tree.withType {
@@ -311,7 +366,7 @@ trait TypeAssigner {
     val cls = qualifyingClass(tree, tree.qual.name, packageOK = false)
     tree.withType(
         if (cls.isClass) cls.thisType
-        else errorType("not a legal qualifying class for this", tree.pos))
+        else errorType("not a legal qualifying class for this", tree.sourcePos))
   }
 
   def assignType(tree: untpd.Super, qual: Tree, inConstrCall: Boolean, mixinClass: Symbol = NoSymbol)(implicit ctx: Context): Super = {
@@ -324,9 +379,9 @@ trait TypeAssigner {
           case p :: Nil =>
             p.typeConstructor
           case Nil =>
-            errorType(SuperQualMustBeParent(mix, cls), tree.pos)
+            errorType(SuperQualMustBeParent(mix, cls), tree.sourcePos)
           case p :: q :: _ =>
-            errorType("ambiguous parent class qualifier", tree.pos)
+            errorType("ambiguous parent class qualifier", tree.sourcePos)
         }
         val owntype =
           if (mixinClass.exists) mixinClass.appliedRef
@@ -359,7 +414,7 @@ trait TypeAssigner {
       safeSubstParams(tp1, params.tail, argTypes1)
     case Nil =>
       tp
-    }
+  }
 
   def assignType(tree: untpd.Apply, fn: Tree, args: List[Tree])(implicit ctx: Context): Apply = {
     val ownType = fn.tpe.widen match {
@@ -368,73 +423,83 @@ trait TypeAssigner {
           if (fntpe.isResultDependent) safeSubstParams(fntpe.resultType, fntpe.paramRefs, args.tpes)
           else fntpe.resultType
         else
-          errorType(i"wrong number of arguments at ${ctx.phase.prev} for $fntpe: ${fn.tpe}, expected: ${fntpe.paramInfos.length}, found: ${args.length}", tree.pos)
+          errorType(i"wrong number of arguments at ${ctx.phase.prev} for $fntpe: ${fn.tpe}, expected: ${fntpe.paramInfos.length}, found: ${args.length}", tree.sourcePos)
       case t =>
-        errorType(err.takesNoParamsStr(fn, ""), tree.pos)
+        if (ctx.settings.Ydebug.value) new FatalError("").printStackTrace()
+        errorType(err.takesNoParamsStr(fn, ""), tree.sourcePos)
     }
     ConstFold(tree.withType(ownType))
   }
 
   def assignType(tree: untpd.TypeApply, fn: Tree, args: List[Tree])(implicit ctx: Context): TypeApply = {
-    val ownType = fn.tpe.widen match {
+    def fail = tree.withType(errorType(err.takesNoParamsStr(fn, "type "), tree.sourcePos))
+    fn.tpe.widen match {
       case pt: TypeLambda =>
-        val paramNames = pt.paramNames
-        if (hasNamedArg(args)) {
-          val paramBoundsByName = paramNames.zip(pt.paramInfos).toMap
+        tree.withType {
+          val paramNames = pt.paramNames
+          if (hasNamedArg(args)) {
+            val paramBoundsByName = paramNames.zip(pt.paramInfos).toMap
 
-          // Type arguments which are specified by name (immutable after this first loop)
-          val namedArgMap = new mutable.HashMap[Name, Type]
-          for (NamedArg(name, arg) <- args)
-            if (namedArgMap.contains(name))
-              ctx.error(DuplicateNamedTypeParameter(name), arg.pos)
-            else if (!paramNames.contains(name))
-              ctx.error(UndefinedNamedTypeParameter(name, paramNames), arg.pos)
-            else
-              namedArgMap(name) = arg.tpe
+            // Type arguments which are specified by name (immutable after this first loop)
+            val namedArgMap = new mutable.HashMap[Name, Type]
+            for (NamedArg(name, arg) <- args)
+              if (namedArgMap.contains(name))
+                ctx.error(DuplicateNamedTypeParameter(name), arg.sourcePos)
+              else if (!paramNames.contains(name))
+                ctx.error(UndefinedNamedTypeParameter(name, paramNames), arg.sourcePos)
+              else
+                namedArgMap(name) = arg.tpe
 
-          // Holds indexes of non-named typed arguments in paramNames
-          val gapBuf = new mutable.ListBuffer[Int]
-          def nextPoly(idx: Int) = {
-            val newIndex = gapBuf.length
-            gapBuf += idx
-            // Re-index unassigned type arguments that remain after transformation
-            pt.paramRefs(newIndex)
-          }
+            // Holds indexes of non-named typed arguments in paramNames
+            val gapBuf = new mutable.ListBuffer[Int]
+            def nextPoly(idx: Int) = {
+              val newIndex = gapBuf.length
+              gapBuf += idx
+              // Re-index unassigned type arguments that remain after transformation
+              pt.paramRefs(newIndex)
+            }
 
-          // Type parameters after naming assignment, conserving paramNames order
-          val normArgs: List[Type] = paramNames.zipWithIndex.map { case (pname, idx) =>
-            namedArgMap.getOrElse(pname, nextPoly(idx))
-          }
+            // Type parameters after naming assignment, conserving paramNames order
+            val normArgs: List[Type] = paramNames.zipWithIndex.map { case (pname, idx) =>
+              namedArgMap.getOrElse(pname, nextPoly(idx))
+            }
 
-          val transform = new TypeMap {
-            def apply(t: Type) = t match {
-              case TypeParamRef(`pt`, idx) => normArgs(idx)
-              case _ => mapOver(t)
+            val transform = new TypeMap {
+              def apply(t: Type) = t match {
+                case TypeParamRef(`pt`, idx) => normArgs(idx)
+                case _ => mapOver(t)
+              }
+            }
+            val resultType1 = transform(pt.resultType)
+            if (gapBuf.isEmpty) resultType1
+            else {
+              val gaps = gapBuf.toList
+              pt.derivedLambdaType(
+                gaps.map(paramNames),
+                gaps.map(idx => transform(pt.paramInfos(idx)).bounds),
+                resultType1)
             }
           }
-          val resultType1 = transform(pt.resultType)
-          if (gapBuf.isEmpty) resultType1
           else {
-            val gaps = gapBuf.toList
-            pt.derivedLambdaType(
-              gaps.map(paramNames),
-              gaps.map(idx => transform(pt.paramInfos(idx)).bounds),
-              resultType1)
+            val argTypes = args.tpes
+            if (sameLength(argTypes, paramNames)) pt.instantiate(argTypes)
+            else wrongNumberOfTypeArgs(fn.tpe, pt.typeParams, args, tree.sourcePos)
           }
         }
-        else {
-          val argTypes = args.tpes
-          if (sameLength(argTypes, paramNames)) pt.instantiate(argTypes)
-          else wrongNumberOfTypeArgs(fn.tpe, pt.typeParams, args, tree.pos)
-        }
       case err: ErrorType =>
-        err
+        tree.withType(err)
+      case ref: TermRef if ref.isOverloaded =>
+        val disambiguated = ref.denot.suchThat(_.info.isInstanceOf[PolyType])
+        if (disambiguated.exists) {
+          val fn1 = fn.withType(ref.withDenot(disambiguated))
+          val tree1 = untpd.cpy.TypeApply(tree)(fn1, args)
+          assignType(tree1, fn1, args)
+        }
+        else fail
       case _ =>
         //println(i"bad type: $fn: ${fn.symbol} / ${fn.symbol.isType} / ${fn.symbol.info}") // DEBUG
-        errorType(err.takesNoParamsStr(fn, "type "), tree.pos)
+        fail
     }
-
-    tree.withType(ownType)
   }
 
   def assignType(tree: untpd.Typed, tpt: Tree)(implicit ctx: Context): Typed =
@@ -471,7 +536,7 @@ trait TypeAssigner {
         }
         HKTypeLambda.fromParams(
           params(new mutable.ListBuffer[TypeSymbol](), pat).toList,
-          defn.FunctionOf(pat.tpe :: Nil, body.tpe))
+          defn.MatchCase(pat.tpe, body.tpe))
       }
       else body.tpe
     tree.withType(ownType)
@@ -504,33 +569,30 @@ trait TypeAssigner {
   def assignType(tree: untpd.SingletonTypeTree, ref: Tree)(implicit ctx: Context): SingletonTypeTree =
     tree.withType(ref.tpe)
 
-  def assignType(tree: untpd.AndTypeTree, left: Tree, right: Tree)(implicit ctx: Context): AndTypeTree =
-    tree.withType(AndType(left.tpe, right.tpe))
-
-  def assignType(tree: untpd.OrTypeTree, left: Tree, right: Tree)(implicit ctx: Context): OrTypeTree =
-    tree.withType(OrType(left.tpe, right.tpe))
-
   /** Assign type of RefinedType.
    *  Refinements are typed as if they were members of refinement class `refineCls`.
    */
   def assignType(tree: untpd.RefinedTypeTree, parent: Tree, refinements: List[Tree], refineCls: ClassSymbol)(implicit ctx: Context): RefinedTypeTree = {
     def addRefinement(parent: Type, refinement: Tree): Type = {
       val rsym = refinement.symbol
-      val rinfo = if (rsym is Accessor) rsym.info.resultType else rsym.info
+      val rinfo = if (rsym.is(Accessor)) rsym.info.resultType else rsym.info
       if (rinfo.isError) rinfo
       else if (!rinfo.exists) parent // can happen after failure in self type definition
       else RefinedType(parent, rsym.name, rinfo)
     }
-    val refined = (parent.tpe /: refinements)(addRefinement)
+    val refined = refinements.foldLeft(parent.tpe)(addRefinement)
     tree.withType(RecType.closeOver(rt => refined.substThis(refineCls, rt.recThis)))
   }
 
   def assignType(tree: untpd.AppliedTypeTree, tycon: Tree, args: List[Tree])(implicit ctx: Context): AppliedTypeTree = {
-    assert(!hasNamedArg(args))
+    assert(!hasNamedArg(args) || ctx.reporter.errorsReported, tree)
     val tparams = tycon.tpe.typeParams
     val ownType =
-      if (sameLength(tparams, args)) tycon.tpe.appliedTo(args.tpes)
-      else wrongNumberOfTypeArgs(tycon.tpe, tparams, args, tree.pos)
+      if (sameLength(tparams, args))
+        if (tycon.symbol == defn.andType) AndType(args(0).tpe, args(1).tpe)
+        else if (tycon.symbol == defn.orType) OrType(args(0).tpe, args(1).tpe)
+        else tycon.tpe.appliedTo(args.tpes)
+      else wrongNumberOfTypeArgs(tycon.tpe, tparams, args, tree.sourcePos)
     tree.withType(ownType)
   }
 
@@ -545,8 +607,11 @@ trait TypeAssigner {
   def assignType(tree: untpd.ByNameTypeTree, result: Tree)(implicit ctx: Context): ByNameTypeTree =
     tree.withType(ExprType(result.tpe))
 
-  def assignType(tree: untpd.TypeBoundsTree, lo: Tree, hi: Tree)(implicit ctx: Context): TypeBoundsTree =
-    tree.withType(if (lo eq hi) TypeAlias(lo.tpe) else TypeBounds(lo.tpe, hi.tpe))
+  def assignType(tree: untpd.TypeBoundsTree, lo: Tree, hi: Tree, alias: Tree)(implicit ctx: Context): TypeBoundsTree =
+    tree.withType(
+      if !alias.isEmpty then alias.tpe
+      else if lo eq hi then TypeAlias(lo.tpe)
+      else TypeBounds(lo.tpe, hi.tpe))
 
   def assignType(tree: untpd.Bind, sym: Symbol)(implicit ctx: Context): Bind =
     tree.withType(NamedType(NoPrefix, sym))
@@ -578,8 +643,8 @@ trait TypeAssigner {
 
   def assignType(tree: untpd.PackageDef, pid: Tree)(implicit ctx: Context): PackageDef =
     tree.withType(pid.symbol.termRef)
-
 }
+
 
 object TypeAssigner extends TypeAssigner
 

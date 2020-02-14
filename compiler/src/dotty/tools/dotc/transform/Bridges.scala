@@ -8,7 +8,8 @@ import DenotTransformers._
 import ast.untpd
 import collection.{mutable, immutable}
 import ShortcutImplicits._
-import util.Positions.Position
+import util.Spans.Span
+import util.SourcePosition
 
 /** A helper class for generating bridge methods in class `root`. */
 class Bridges(root: ClassSymbol, thisPhase: DenotTransformer)(implicit ctx: Context) {
@@ -28,20 +29,20 @@ class Bridges(root: ClassSymbol, thisPhase: DenotTransformer)(implicit ctx: Cont
     override def parents = Array(root.superClass)
 
     override def exclude(sym: Symbol) =
-      !sym.is(MethodOrModule) ||
+      !sym.isOneOf(MethodOrModule) ||
       isImplicitShortcut(sym) ||
       super.exclude(sym)
   }
 
   //val site = root.thisType
 
-  private[this] var toBeRemoved = immutable.Set[Symbol]()
+  private var toBeRemoved = immutable.Set[Symbol]()
   private val bridges = mutable.ListBuffer[Tree]()
   private val bridgesScope = newScope
   private val bridgeTarget = newMutableSymbolMap[Symbol]
 
-  def bridgePosFor(member: Symbol): Position =
-    if (member.owner == root && member.pos.exists) member.pos else root.pos
+  def bridgePosFor(member: Symbol): SourcePosition =
+    (if (member.owner == root && member.span.exists) member else root).sourcePos
 
   /** Add a bridge between `member` and `other`, where `member` overrides `other`
    *  before erasure, if the following conditions are satisfied.
@@ -85,12 +86,12 @@ class Bridges(root: ClassSymbol, thisPhase: DenotTransformer)(implicit ctx: Cont
       owner = root,
       flags = (member.flags | Method | Bridge | Artifact) &~
         (Accessor | ParamAccessor | CaseAccessor | Deferred | Lazy | Module),
-      coord = bridgePosFor(member)).enteredAfter(thisPhase).asTerm
+      coord = bridgePosFor(member).span).enteredAfter(thisPhase).asTerm
 
     ctx.debuglog(
       i"""generating bridge from ${other.showLocated}: ${other.info}
-             |to ${member.showLocated}: ${member.info} @ ${member.pos}
-             |bridge: ${bridge.showLocated} with flags: ${bridge.flags}""")
+             |to ${member.showLocated}: ${member.info} @ ${member.span}
+             |bridge: ${bridge.showLocated} with flags: ${bridge.flagsString}""")
 
     bridgeTarget(bridge) = member
     bridgesScope.enter(bridge)
@@ -106,7 +107,7 @@ class Bridges(root: ClassSymbol, thisPhase: DenotTransformer)(implicit ctx: Cont
       else ref.appliedToArgss(argss)
     }
 
-    bridges += DefDef(bridge, bridgeRhs(_).withPos(bridge.pos))
+    bridges += DefDef(bridge, bridgeRhs(_).withSpan(bridge.span))
   }
 
   /** Add all necessary bridges to template statements `stats`, and remove at the same

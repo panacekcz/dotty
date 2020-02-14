@@ -1,8 +1,10 @@
 package dotty.tools.dotc.core.tasty
 
 import dotty.tools.dotc.core.Comments.Comment
-import dotty.tools.dotc.core.tasty.TastyBuffer.Addr
-import dotty.tools.dotc.util.Positions.Position
+import dotty.tools.dotc.util.Spans.Span
+
+import dotty.tools.tasty.{TastyReader, TastyBuffer}
+import TastyBuffer.Addr
 
 import scala.collection.mutable.HashMap
 
@@ -18,7 +20,7 @@ class CommentUnpickler(reader: TastyReader) {
       val length = readNat()
       if (length > 0) {
         val bytes = readBytes(length)
-        val position = new Position(readLongInt())
+        val position = new Span(readLongInt())
         val rawComment = new String(bytes, Charset.forName("UTF-8"))
         comments(addr) = Comment(position, rawComment)
       }
@@ -28,5 +30,4 @@ class CommentUnpickler(reader: TastyReader) {
 
   def commentAt(addr: Addr): Option[Comment] =
     comments.get(addr)
-
 }

@@ -89,7 +89,7 @@ class TreeTypeMap(
     case tree1 =>
       tree1.withType(mapType(tree1.tpe)) match {
         case id: Ident if tpd.needsSelect(id.tpe) =>
-          ref(id.tpe.asInstanceOf[TermRef]).withPos(id.pos)
+          ref(id.tpe.asInstanceOf[TermRef]).withSpan(id.span)
         case ddef @ DefDef(name, tparams, vparamss, tpt, _) =>
           val (tmap1, tparams1) = transformDefs(ddef.tparams)
           val (tmap2, vparamss1) = tmap1.transformVParamss(vparamss)
@@ -121,8 +121,8 @@ class TreeTypeMap(
           val bind1 = tmap.transformSub(bind)
           val expr1 = tmap.transform(expr)
           cpy.Labeled(labeled)(bind1, expr1)
-        case Hole(n, args) =>
-          Hole(n, args.mapConserve(transform)).withPos(tree.pos).withType(mapType(tree.tpe))
+        case Hole(isTermHole, n, args) =>
+          Hole(isTermHole, n, args.mapConserve(transform)).withSpan(tree.span).withType(mapType(tree.tpe))
         case tree1 =>
           super.transform(tree1)
       }
@@ -185,11 +185,12 @@ class TreeTypeMap(
   def withMappedSyms(syms: List[Symbol], mapped: List[Symbol]): TreeTypeMap = {
     val symsChanged = syms ne mapped
     val substMap = withSubstitution(syms, mapped)
-    val fullMap = (substMap /: mapped.filter(_.isClass)) { (tmap, cls) =>
+    val fullMap = mapped.filter(_.isClass).foldLeft(substMap) { (tmap, cls) =>
       val origDcls = cls.info.decls.toList
       val mappedDcls = ctx.mapSymbols(origDcls, tmap)
       val tmap1 = tmap.withMappedSyms(origDcls, mappedDcls)
-      if (symsChanged) (origDcls, mappedDcls).zipped.foreach(cls.asClass.replace)
+      if (symsChanged)
+        origDcls.lazyZip(mappedDcls).foreach(cls.asClass.replace)
       tmap1
     }
     if (symsChanged || (fullMap eq substMap)) fullMap

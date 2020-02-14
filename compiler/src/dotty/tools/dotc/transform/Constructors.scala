@@ -74,7 +74,7 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
             }
             else retain()
           case _ => retain()
-        }
+      }
     }
   }
 
@@ -99,7 +99,7 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
    */
   override def checkPostCondition(tree: tpd.Tree)(implicit ctx: Context): Unit = {
     def emptyRhsOK(sym: Symbol) =
-      sym.is(LazyOrDeferred) || sym.isConstructor && sym.owner.is(NoInitsTrait)
+      sym.isOneOf(DeferredOrLazy) || sym.isConstructor && sym.owner.isAllOf(NoInitsTrait)
     tree match {
       case tree: ValDef if tree.symbol.exists && tree.symbol.owner.isClass && !tree.symbol.is(Lazy) && !tree.symbol.hasAnnotation(defn.ScalaStaticAnnot) =>
         assert(tree.rhs.isEmpty, i"$tree: initializer should be moved to constructors")
@@ -119,9 +119,9 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
    *  constructor.
    */
   private def mightBeDropped(sym: Symbol)(implicit ctx: Context) =
-    sym.is(Private, butNot = MethodOrLazy) && !sym.is(MutableParamAccessor)
+    sym.is(Private, butNot = MethodOrLazy) && !sym.isAllOf(MutableParamAccessor)
 
-  private final val MutableParamAccessor = allOf(Mutable, ParamAccessor)
+  private final val MutableParamAccessor = Mutable | ParamAccessor
 
   override def transformTemplate(tree: Template)(implicit ctx: Context): Tree = {
     val cls = ctx.owner.asClass
@@ -148,8 +148,8 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
       override def transform(tree: Tree)(implicit ctx: Context): Tree = tree match {
         case Ident(_) | Select(This(_), _) =>
           var sym = tree.symbol
-          if (sym is (ParamAccessor, butNot = Mutable)) sym = sym.subst(accessors, paramSyms)
-          if (sym.owner.isConstructor) ref(sym).withPos(tree.pos) else tree
+          if (sym.is(ParamAccessor, butNot = Mutable)) sym = sym.subst(accessors, paramSyms)
+          if (sym.owner.isConstructor) ref(sym).withSpan(tree.span) else tree
         case Apply(fn, Nil) =>
           val fn1 = transform(fn)
           if ((fn1 ne fn) && fn1.symbol.is(Param) && fn1.symbol.owner.isPrimaryConstructor)
@@ -159,14 +159,12 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
           if (noDirectRefsFrom(tree)) tree else super.transform(tree)
       }
 
-      def apply(tree: Tree, prevOwner: Symbol)(implicit ctx: Context): Tree = {
+      def apply(tree: Tree, prevOwner: Symbol)(implicit ctx: Context): Tree =
         transform(tree).changeOwnerAfter(prevOwner, constr.symbol, thisPhase)
-      }
     }
 
-    def isRetained(acc: Symbol) = {
+    def isRetained(acc: Symbol) =
       !mightBeDropped(acc) || retainedPrivateVals(acc)
-    }
 
     val constrStats, clsStats = new mutable.ListBuffer[Tree]
 
@@ -195,7 +193,7 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
             val sym = stat.symbol
             if (isRetained(sym)) {
               if (!stat.rhs.isEmpty && !isWildcardArg(stat.rhs))
-                constrStats += Assign(ref(sym), intoConstr(stat.rhs, sym)).withPos(stat.pos)
+                constrStats += Assign(ref(sym), intoConstr(stat.rhs, sym)).withSpan(stat.span)
               clsStats += cpy.ValDef(stat)(rhs = EmptyTree)
             }
             else if (!stat.rhs.isEmpty) {
@@ -214,7 +212,6 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
         }
         splitStats(stats1)
       case Nil =>
-        (Nil, Nil)
     }
     splitStats(tree.body)
 
@@ -223,17 +220,24 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
       if (!isRetained(acc)) {
         dropped += acc
         Nil
-      } else {
+      }
+      else if (!isRetained(acc.field)) { // It may happen for unit fields, tests/run/i6987.scala
+        dropped += acc.field
+        Nil
+      }
+      else {
+        if (acc.hasAnnotation(defn.TransientParamAnnot))
+          ctx.error(em"transient parameter $acc is retained as field in class ${acc.owner}", acc.sourcePos)
         val target = if (acc.is(Method)) acc.field else acc
         if (!target.exists) Nil // this case arises when the parameter accessor is an alias
         else {
           val param = acc.subst(accessors, paramSyms)
-          val assigns = Assign(ref(target), ref(param)).withPos(tree.pos) :: Nil
+          val assigns = Assign(ref(target), ref(param)).withSpan(tree.span) :: Nil
           if (acc.name != nme.OUTER) assigns
           else {
             // insert test: if ($outer eq null) throw new NullPointerException
             val nullTest =
-              If(ref(param).select(defn.Object_eq).appliedTo(Literal(Constant(null))),
+              If(ref(param).select(defn.Object_eq).appliedTo(nullLiteral),
                  Throw(New(defn.NullPointerExceptionClass.typeRef, Nil)),
                  unitLiteral)
             nullTest :: assigns
@@ -248,7 +252,6 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
       cls.copy(
         info = clsInfo.derivedClassInfo(
           decls = clsInfo.decls.filteredScope(!dropped.contains(_))))
-
       // TODO: this happens to work only because Constructors is the last phase in group
     }
 
@@ -273,14 +276,12 @@ class Constructors extends MiniPhase with IdentityDenotTransformer { thisPhase =
 
     val finalConstrStats = copyParams ::: mappedSuperCalls ::: lazyAssignments ::: stats
     val expandedConstr =
-      if (cls.is(NoInitsTrait)) {
+      if (cls.isAllOf(NoInitsTrait)) {
         assert(finalConstrStats.isEmpty)
         constr
       }
       else cpy.DefDef(constr)(rhs = Block(finalConstrStats, unitLiteral))
 
-    cpy.Template(tree)(
-      constr = expandedConstr,
-      body = clsStats.toList)
+    cpy.Template(tree)(constr = expandedConstr, body = clsStats.toList)
   }
 }

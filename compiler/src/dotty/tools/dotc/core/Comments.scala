@@ -5,7 +5,7 @@ package core
 import ast.{ untpd, tpd }
 import Decorators._, Symbols._, Contexts._
 import util.SourceFile
-import util.Positions._
+import util.Spans._
 import util.CommentParsing._
 import util.Property.Key
 import parsing.Parsers.Parser
@@ -24,7 +24,7 @@ object Comments {
     */
   class ContextDocstrings {
 
-    private[this] val _docstrings: MutableSymbolMap[Comment] = newMutableSymbolMap
+    private val _docstrings: MutableSymbolMap[Comment] = newMutableSymbolMap
 
     val templateExpander: CommentExpander = new CommentExpander
 
@@ -40,12 +40,12 @@ object Comments {
    * A `Comment` contains the unformatted docstring, it's position and potentially more
    * information that is populated when the comment is "cooked".
    *
-   * @param pos      The position of this `Comment`.
+   * @param span     The position span of this `Comment`.
    * @param raw      The raw comment, as seen in the source code, without any expansion.
    * @param expanded If this comment has been expanded, it's expansion, otherwise `None`.
    * @param usecases The usecases for this comment.
    */
-  final case class Comment(pos: Position, raw: String, expanded: Option[String], usecases: List[UseCase]) {
+  final case class Comment(span: Span, raw: String, expanded: Option[String], usecases: List[UseCase]) {
 
     /** Has this comment been cooked or expanded? */
     def isExpanded: Boolean = expanded.isDefined
@@ -65,8 +65,8 @@ object Comments {
      */
     def expand(f: String => String)(implicit ctx: Context): Comment = {
       val expandedComment = f(raw)
-      val useCases = Comment.parseUsecases(expandedComment, pos)
-      Comment(pos, raw, Some(expandedComment), useCases)
+      val useCases = Comment.parseUsecases(expandedComment, span)
+      Comment(span, raw, Some(expandedComment), useCases)
     }
   }
 
@@ -74,17 +74,16 @@ object Comments {
 
     def isDocComment(comment: String): Boolean = comment.startsWith("/**")
 
-    def apply(pos: Position, raw: String): Comment =
-      Comment(pos, raw, None, Nil)
+    def apply(span: Span, raw: String): Comment =
+      Comment(span, raw, None, Nil)
 
-    private def parseUsecases(expandedComment: String, pos: Position)(implicit ctx: Context): List[UseCase] =
-      if (!isDocComment(expandedComment)) {
+    private def parseUsecases(expandedComment: String, span: Span)(implicit ctx: Context): List[UseCase] =
+      if (!isDocComment(expandedComment))
         Nil
-      } else {
+      else
         tagIndex(expandedComment)
           .filter { startsWithTag(expandedComment, _, "@usecase") }
-          .map { case (start, end) => decomposeUseCase(expandedComment, pos, start, end) }
-      }
+          .map { case (start, end) => decomposeUseCase(expandedComment, span, start, end) }
 
     /** Turns a usecase section into a UseCase, with code changed to:
      *  {{{
@@ -94,13 +93,13 @@ object Comments {
      *  def foo: A = ???
      *  }}}
      */
-    private[this] def decomposeUseCase(body: String, pos: Position, start: Int, end: Int)(implicit ctx: Context): UseCase = {
+    private def decomposeUseCase(body: String, span: Span, start: Int, end: Int)(implicit ctx: Context): UseCase = {
       def subPos(start: Int, end: Int) =
-        if (pos == NoPosition) NoPosition
+        if (span == NoSpan) NoSpan
         else {
-          val start1 = pos.start + start
-          val end1 = pos.end + end
-          pos withStart start1 withPoint start1 withEnd end1
+          val start1 = span.start + start
+          val end1 = span.end + end
+          span withStart start1 withPoint start1 withEnd end1
         }
 
       val codeStart = skipWhitespace(body, start + "@usecase".length)
@@ -112,20 +111,20 @@ object Comments {
     }
   }
 
-  final case class UseCase(code: String, codePos: Position, untpdCode: untpd.Tree, tpdCode: Option[tpd.DefDef]) {
+  final case class UseCase(code: String, codePos: Span, untpdCode: untpd.Tree, tpdCode: Option[tpd.DefDef]) {
     def typed(tpdCode: tpd.DefDef): UseCase = copy(tpdCode = Some(tpdCode))
   }
 
   object UseCase {
-    def apply(code: String, codePos: Position)(implicit ctx: Context): UseCase = {
+    def apply(code: String, codePos: Span)(implicit ctx: Context): UseCase = {
       val tree = {
-        val tree = new Parser(new SourceFile("<usecase>", code)).localDef(codePos.start)
+        val tree = new Parser(SourceFile.virtual("<usecase>", code)).localDef(codePos.start)
         tree match {
           case tree: untpd.DefDef =>
-            val newName = ctx.freshNames.newName(tree.name, NameKinds.DocArtifactName)
-            tree.copy(name = newName)
+            val newName = ctx.compilationUnit.freshNames.newName(tree.name, NameKinds.DocArtifactName)
+            untpd.cpy.DefDef(tree)(name = newName)
           case _ =>
-            ctx.error(ProperDefinitionNotFound(), codePos)
+            ctx.error(ProperDefinitionNotFound(), ctx.source.atSpan(codePos))
             tree
         }
       }
@@ -199,7 +198,7 @@ object Comments {
         case None =>
           // SI-8210 - The warning would be false negative when this symbol is a setter
           if (ownComment.indexOf("@inheritdoc") != -1 && ! sym.isSetter)
-            dottydoc.println(s"${sym.pos}: the comment for ${sym} contains @inheritdoc, but no parent comment is available to inherit from.")
+            dottydoc.println(s"${sym.span}: the comment for ${sym} contains @inheritdoc, but no parent comment is available to inherit from.")
           ownComment.replaceAllLiterally("@inheritdoc", "<invalid inheritdoc annotation>")
         case Some(sc) =>
           if (ownComment == "") sc
@@ -236,12 +235,11 @@ object Comments {
           if (end > tocopy) tocopy = end
         case None =>
           srcSec match {
-            case Some((start1, end1)) => {
+            case Some((start1, end1)) =>
               out append dst.substring(copied, tocopy).trim
               out append "\n"
               copied = tocopy
               out append src.substring(start1, end1).trim
-            }
             case None =>
           }
       }
@@ -314,7 +312,7 @@ object Comments {
                 val sectionTextBounds = extractSectionText(parent, section)
                 cleanupSectionText(parent.substring(sectionTextBounds._1, sectionTextBounds._2))
               case None =>
-                dottydoc.println(s"""${sym.pos}: the """" + getSectionHeader + "\" annotation of the " + sym +
+                dottydoc.println(s"""${sym.span}: the """" + getSectionHeader + "\" annotation of the " + sym +
                     " comment contains @inheritdoc, but the corresponding section in the parent is not defined.")
                 "<invalid inheritdoc annotation>"
             }
@@ -357,7 +355,7 @@ object Comments {
         // excluding variables written as \$foo so we can use them when
         // necessary to document things like Symbol#decode
         def isEscaped = idx > 0 && str.charAt(idx - 1) == '\\'
-        while (idx < str.length) {
+        while (idx < str.length)
           if ((str charAt idx) != '$' || isEscaped)
             idx += 1
           else {
@@ -383,9 +381,8 @@ object Comments {
                   case None              =>
                     dottydoc.println(s"Variable $vname undefined in comment for $sym in $site")
                 }
-              }
+            }
           }
-        }
         if (out.length == 0) str
         else {
           out append str.substring(copied)
@@ -441,18 +438,17 @@ object Comments {
      *  If a symbol does not have a doc comment but some overridden version of it does,
      *  the position of the doc comment of the overridden version is returned instead.
      */
-    def docCommentPos(sym: Symbol)(implicit ctx: Context): Position =
-      ctx.docCtx.flatMap(_.docstring(sym).map(_.pos)).getOrElse(NoPosition)
+    def docCommentPos(sym: Symbol)(implicit ctx: Context): Span =
+      ctx.docCtx.flatMap(_.docstring(sym).map(_.span)).getOrElse(NoSpan)
 
     /** A version which doesn't consider self types, as a temporary measure:
      *  an infinite loop has broken out between superComment and cookedDocComment
      *  since r23926.
      */
-    private def allInheritedOverriddenSymbols(sym: Symbol)(implicit ctx: Context): List[Symbol] = {
+    private def allInheritedOverriddenSymbols(sym: Symbol)(implicit ctx: Context): List[Symbol] =
       if (!sym.owner.isClass) Nil
       else sym.allOverriddenSymbols.toList.filter(_ != NoSymbol) //TODO: could also be `sym.owner.allOverrid..`
       //else sym.owner.ancestors map (sym overriddenSymbol _) filter (_ != NoSymbol)
-    }
 
     class ExpansionLimitExceeded(str: String) extends Exception
   }

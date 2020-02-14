@@ -20,7 +20,7 @@ class PickleBuffer(data: Array[Byte], from: Int, to: Int) {
   /** Double bytes array */
   private def dble(): Unit = {
     val bytes1 = new Array[Byte](bytes.length * 2)
-    Array.copy(bytes, 0, bytes1, 0, writeIndex)
+    System.arraycopy(bytes, 0, bytes1, 0, writeIndex)
     bytes = bytes1
   }
 
@@ -69,7 +69,7 @@ class PickleBuffer(data: Array[Byte], from: Int, to: Int) {
   def patchNat(pos: Int, x: Int): Unit = {
     def patchNatPrefix(x: Int): Unit = {
       writeByte(0)
-      Array.copy(bytes, pos, bytes, pos + 1, writeIndex - (pos + 1))
+      System.arraycopy(bytes, pos, bytes, pos + 1, writeIndex - (pos + 1))
       bytes(pos) = ((x & 0x7f) | 0x80).toByte
       val y = x >>> 7
       if (y != 0) patchNatPrefix(y)
@@ -107,10 +107,12 @@ class PickleBuffer(data: Array[Byte], from: Int, to: Int) {
   def readLongNat(): Long = {
     var b = 0L
     var x = 0L
-    do {
+    while ({
       b = readByte()
       x = (x << 7) + (b & 0x7f)
-    } while ((b & 0x80) != 0L)
+      (b & 0x80) != 0L
+    })
+    ()
     x
   }
 
@@ -218,7 +220,7 @@ object PickleBuffer {
       LOCAL -> Local,
       JAVA -> JavaDefined,
       SYNTHETIC -> Synthetic,
-      STABLE -> Stable,
+      STABLE -> StableRealizable,
       STATIC -> JavaStatic,
       CASEACCESSOR -> CaseAccessor,
       DEFAULTPARAM -> (DefaultParameterized, Trait),
@@ -230,7 +232,6 @@ object PickleBuffer {
       LAZY -> Lazy,
       MIXEDIN -> (MixedIn, Scala2Existential),
       EXPANDEDNAME -> Scala2ExpandedName,
-      IMPLCLASS -> (Scala2PreSuper, ImplClass),
       SPECIALIZED -> Specialized,
       VBRIDGE -> EmptyFlags,
       VARARGS -> JavaVarargs,

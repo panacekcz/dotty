@@ -89,7 +89,6 @@ trait Page {
     new SourceFile(virtualFile, Codec.UTF8)
   }
 
-
   protected[this] var _yaml: Map[String, AnyRef /* String | JList[String] */] = _
   protected[this] var _html: Option[String] = _
   protected[this] def initFields(implicit ctx: Context) = {
@@ -100,15 +99,15 @@ trait Page {
     _yaml = updatedYaml {
       yamlCollector
       .getData().asScala
-      .mapValues {
-        case xs if xs.size == 1 =>
+      .toMap
+      .transform {
+        case (_, xs) if xs.size == 1 =>
           val str = xs.get(0)
           if (str.length > 0 && str.head == '"' && str.last == '"')
             str.substring(1, str.length - 1)
           else str
-        case xs => xs
+        case (_, xs) => xs
       }
-      .toMap
     }
 
     // YAML must start with "---" and end in either "---" or "..."

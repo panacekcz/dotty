@@ -12,9 +12,9 @@ import dotty.tools.dotc.core.Phases.Phase
 import dotty.tools.dotc.core.StdNames._
 import dotty.tools.dotc.core.Symbols._
 import dotty.tools.dotc.reporting.diagnostic.messages
-import dotty.tools.dotc.transform.PostTyper
+import dotty.tools.dotc.transform.{PostTyper, Staging}
 import dotty.tools.dotc.typer.ImportInfo
-import dotty.tools.dotc.util.Positions._
+import dotty.tools.dotc.util.Spans._
 import dotty.tools.dotc.util.{ParsedComment, SourceFile}
 import dotty.tools.dotc.{CompilationUnit, Compiler, Run}
 import dotty.tools.repl.results._
@@ -34,22 +34,26 @@ class ReplCompiler extends Compiler {
   override protected def frontendPhases: List[List[Phase]] = List(
     List(new REPLFrontEnd),
     List(new CollectTopLevelImports),
+    List(new Staging),
     List(new PostTyper)
   )
 
   def newRun(initCtx: Context, state: State): Run = new Run(this, initCtx) {
 
     /** Import previous runs and user defined imports */
-    override protected[this] def rootContext(implicit ctx: Context): Context = {
+    override protected def rootContext(implicit ctx: Context): Context = {
       def importContext(imp: tpd.Import)(implicit ctx: Context) =
         ctx.importContext(imp, imp.symbol)
 
       def importPreviousRun(id: Int)(implicit ctx: Context) = {
         // we first import the wrapper object id
         val path = nme.EMPTY_PACKAGE ++ "." ++ objectNames(id)
-        val importInfo = ImportInfo.rootImport(() =>
-          ctx.requiredModuleRef(path))
-        val ctx0 = ctx.fresh.setNewScope.setImportInfo(importInfo)
+        def importWrapper(c: Context, importGiven: Boolean) = {
+          val importInfo = ImportInfo.rootImport(() =>
+            c.requiredModuleRef(path), importGiven)
+          c.fresh.setNewScope.setImportInfo(importInfo)
+        }
+        val ctx0 = importWrapper(importWrapper(ctx, false), true)
 
         // then its user defined imports
         val imports = state.imports.getOrElse(id, Nil)
@@ -63,10 +67,7 @@ class ReplCompiler extends Compiler {
     }
   }
 
-  private[this] val objectNames = mutable.Map.empty[Int, TermName]
-  private def objectName(state: State) =
-    objectNames.getOrElseUpdate(state.objectIndex,
-      (str.REPL_SESSION_LINE + state.objectIndex).toTermName)
+  private val objectNames = mutable.Map.empty[Int, TermName]
 
   private case class Definitions(stats: List[untpd.Tree], state: State)
 
@@ -75,28 +76,38 @@ class ReplCompiler extends Compiler {
 
     implicit val ctx: Context = state.context
 
-    var valIdx = state.valIndex
+    // If trees is of the form `{ def1; def2; def3 }` then `List(def1, def2, def3)`
+    val flattened = trees match {
+      case List(Block(stats, expr)) =>
+        if (expr eq EmptyTree) stats // happens when expr is not an expression
+        else stats :+ expr
+      case _ =>
+        trees
+    }
 
-    val defs = trees.flatMap {
+    var valIdx = state.valIndex
+    val defs = new mutable.ListBuffer[Tree]
+
+    flattened.foreach {
       case expr @ Assign(id: Ident, _) =>
         // special case simple reassignment (e.g. x = 3)
         // in order to print the new value in the REPL
         val assignName = (id.name ++ str.REPL_ASSIGN_SUFFIX).toTermName
-        val assign = ValDef(assignName, TypeTree(), id).withPos(expr.pos)
-        List(expr, assign)
+        val assign = ValDef(assignName, TypeTree(), id).withSpan(expr.span)
+        defs += expr += assign
       case expr if expr.isTerm =>
         val resName = (str.REPL_RES_PREFIX + valIdx).toTermName
         valIdx += 1
-        val vd = ValDef(resName, TypeTree(), expr).withPos(expr.pos)
-        vd :: Nil
+        val vd = ValDef(resName, TypeTree(), expr).withSpan(expr.span)
+        defs += vd
       case other =>
-        other :: Nil
+        defs += other
     }
 
     Definitions(
-      defs,
+      defs.toList,
       state.copy(
-        objectIndex = state.objectIndex + (if (defs.isEmpty) 0 else 1),
+        objectIndex = state.objectIndex + 1,
         valIndex = valIdx
       )
     )
@@ -116,23 +127,27 @@ class ReplCompiler extends Compiler {
    *  }
    *  ```
    */
-  private def wrapped(defs: Definitions): untpd.PackageDef = {
+  private def wrapped(defs: Definitions, objectTermName: TermName, span: Span): untpd.PackageDef = {
     import untpd._
-
-    assert(defs.stats.nonEmpty)
 
     implicit val ctx: Context = defs.state.context
 
-    val tmpl = Template(emptyConstructor, Nil, EmptyValDef, defs.stats)
-    val module = ModuleDef(objectName(defs.state), tmpl)
-      .withPos(Position(0, defs.stats.last.pos.end))
+    val tmpl = Template(emptyConstructor, Nil, Nil, EmptyValDef, defs.stats)
+    val module = ModuleDef(objectTermName, tmpl)
+      .withSpan(span)
 
     PackageDef(Ident(nme.EMPTY_PACKAGE), List(module))
   }
 
-  private def createUnit(defs: Definitions, sourceCode: String): CompilationUnit = {
-    val unit = new CompilationUnit(new SourceFile(objectName(defs.state).toString, sourceCode))
-    unit.untpdTree = wrapped(defs)
+  private def createUnit(defs: Definitions, span: Span)(implicit ctx: Context): CompilationUnit = {
+    val objectName = ctx.source.file.toString
+    assert(objectName.startsWith(str.REPL_SESSION_LINE))
+    assert(objectName.endsWith(defs.state.objectIndex.toString))
+    val objectTermName = ctx.source.file.toString.toTermName
+    objectNames.update(defs.state.objectIndex, objectTermName)
+
+    val unit = CompilationUnit(ctx.source)
+    unit.untpdTree = wrapped(defs, objectTermName, span)
     unit
   }
 
@@ -145,8 +160,9 @@ class ReplCompiler extends Compiler {
   }
 
   final def compile(parsed: Parsed)(implicit state: State): Result[(CompilationUnit, State)] = {
+    assert(!parsed.trees.isEmpty)
     val defs = definitions(parsed.trees, state)
-    val unit = createUnit(defs, parsed.sourceCode)
+    val unit = createUnit(defs, Span(0, parsed.trees.last.span.end))(state.context)
     runCompilationUnit(unit, defs.state)
   }
 
@@ -217,15 +233,15 @@ class ReplCompiler extends Compiler {
       def wrap(trees: List[untpd.Tree]): untpd.PackageDef = {
         import untpd._
 
-        val valdef = ValDef("expr".toTermName, TypeTree(), Block(trees, unitLiteral))
-        val tmpl = Template(emptyConstructor, Nil, EmptyValDef, List(valdef))
+        val valdef = ValDef("expr".toTermName, TypeTree(), Block(trees, unitLiteral).withSpan(Span(0, expr.length)))
+        val tmpl = Template(emptyConstructor, Nil, Nil, EmptyValDef, List(valdef))
         val wrapper = TypeDef("$wrapper".toTypeName, tmpl)
           .withMods(Modifiers(Final))
-          .withPos(Position(0, expr.length))
+          .withSpan(Span(0, expr.length))
         PackageDef(Ident(nme.EMPTY_PACKAGE), List(wrapper))
       }
 
-      ParseResult(expr) match {
+      ParseResult(sourceFile)(state) match {
         case Parsed(_, trees) =>
           wrap(trees).result
         case SyntaxErrors(_, reported, trees) =>
@@ -234,7 +250,7 @@ class ReplCompiler extends Compiler {
         case _ => List(
           new messages.Error(
             s"Couldn't parse '$expr' to valid scala",
-            sourceFile.atPos(Position(0, expr.length))
+            sourceFile.atSpan(Span(0, expr.length))
           )
         ).errors
       }
@@ -243,7 +259,7 @@ class ReplCompiler extends Compiler {
     def unwrapped(tree: tpd.Tree, sourceFile: SourceFile)(implicit ctx: Context): Result[tpd.ValDef] = {
       def error: Result[tpd.ValDef] =
         List(new messages.Error(s"Invalid scala expression",
-          sourceFile.atPos(Position(0, sourceFile.content.length)))).errors
+          sourceFile.atSpan(Span(0, sourceFile.content.length)))).errors
 
       import tpd._
       tree match {
@@ -257,13 +273,13 @@ class ReplCompiler extends Compiler {
     }
 
 
-    val src = new SourceFile("<typecheck>", expr)
+    val src = SourceFile.virtual("<typecheck>", expr)
     implicit val ctx: Context = state.context.fresh
       .setReporter(newStoreReporter)
-      .setSetting(state.context.settings.YstopAfter, List("frontend"))
+      .setSetting(state.context.settings.YstopAfter, List("typer"))
 
     wrapped(expr, src, state).flatMap { pkg =>
-      val unit = new CompilationUnit(src)
+      val unit = CompilationUnit(src)
       unit.untpdTree = pkg
       ctx.run.compileUnits(unit :: Nil, ctx)
 

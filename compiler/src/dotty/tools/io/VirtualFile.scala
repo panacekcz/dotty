@@ -15,6 +15,7 @@ import java.io.{ ByteArrayInputStream, ByteArrayOutputStream, InputStream, Outpu
  *  ''Note:  This library is considered experimental and should not be used unless you know what you are doing.''
  */
 class VirtualFile(val name: String, override val path: String) extends AbstractFile {
+
   /**
    * Initializes this instance with the specified name and an
    * identical path.
@@ -24,13 +25,20 @@ class VirtualFile(val name: String, override val path: String) extends AbstractF
    */
   def this(name: String) = this(name, name)
 
-  override def hashCode: Int = path.hashCode
-  override def equals(that: Any): Boolean = that match {
-    case x: VirtualFile => x.path == path
-    case _              => false
+  /**
+    * Initializes this instance with the specified name and an
+    * identical path.
+    *
+    * @param name the name of the virtual file to be created
+    * @param content the initial contents of the virtual file
+    * @return     the created virtual file
+    */
+  def this(name: String, content: Array[Byte]) = {
+    this(name)
+    this.content = content
   }
 
-  private[this] var content = Array.emptyByteArray
+  private var content = Array.emptyByteArray
 
   def absolute: AbstractFile = this
 
@@ -58,7 +66,7 @@ class VirtualFile(val name: String, override val path: String) extends AbstractF
   /** @inheritdoc */
   override def isVirtual: Boolean = true
 
-  // private[this] var _lastModified: Long = 0
+  // private var _lastModified: Long = 0
   // _lastModified
 
   /** Returns the time that this abstract file was last modified. */

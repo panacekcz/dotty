@@ -18,7 +18,7 @@ A `Denotation` is the result of a name lookup during a given period
   may be `NoSymbol` (the two variants have symbols).
 * Non-overloaded denotations have an `info`
 
-Denotations of methods have a signature ([Signature.scala:7]), which
+Denotations of methods have a signature ([Signature1]), which
 uniquely identifies overloaded methods.
 
 #### Denotation vs. SymDenotation ####
@@ -55,7 +55,7 @@ if (sym is Flags.PackageClass)  // dotc (*)
 ```
 
 `(*)` Symbols are implicitly converted to their denotation, see above. Each
-`SymDeotation` has flags that can be queried using the `is` method.
+`SymDenotation` has flags that can be queried using the `is` method.
 
 ### Flags ###
 * Flags are instances of the value class `FlagSet`, which encapsulates a
@@ -73,10 +73,6 @@ if (sym is Flags.PackageClass)  // dotc (*)
 * Example: `Module` is valid for both module values and module classes,
   `ModuleVal` / `ModuleClass` for either of the two.
 * `flags.is(Method | Param)`: true if `flags` has either of the two
-* `flags.is(allOf(Method | Deferred))`: true if `flags` has both. `allOf`
-  creates a `FlagConjunction`, so a different overload of `is` is chosen.
-  - Careful: `flags.is(Method & Deferred)` is always true, because `Method &
-    Deferred` is empty.
 
 ### Tree ###
 * Trees don't have symbols

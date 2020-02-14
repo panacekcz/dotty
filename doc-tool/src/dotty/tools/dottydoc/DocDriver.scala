@@ -1,6 +1,8 @@
 package dotty.tools
 package dottydoc
 
+import java.io.File
+
 import dotty.tools.dottydoc.util.syntax._
 import core.ContextDottydoc
 import dotc.core.Contexts._
@@ -38,22 +40,33 @@ class DocDriver extends Driver {
     implicit val ctx: Context = ictx
     val reporter = doCompile(newCompiler, filesToDocument)
 
-    val siteRoot = new java.io.File(ctx.settings.siteRoot.value)
+    val siteRoot = File(ctx.settings.siteRoot.value)
     val projectName = ctx.settings.projectName.value
     val projectVersion = ctx.settings.projectVersion.value
-    val projectUrl = ctx.settings.projectUrl.value
+    val projectUrl = Option(ctx.settings.projectUrl.value).filter(_.nonEmpty)
+    val projectLogo = Option(ctx.settings.projectLogo.value).filter(_.nonEmpty)
+    val docSnapshot = ctx.settings.docSnapshot.value
+
+    val baseUrl = ""
+    val outDir = File(siteRoot, "_site")
+    val snapshotFolderName = if projectVersion.endsWith("NIGHTLY") then "nightly" else projectVersion
+    val snapshotOutDir = File(outDir, snapshotFolderName)
+    val snapshotBaseUrl = s"$baseUrl/$snapshotFolderName"
 
     if (projectName.isEmpty)
       ctx.error(s"Site project name not set. Use `-project <title>` to set the project name")
     else if (!siteRoot.exists || !siteRoot.isDirectory)
       ctx.error(s"Site root does not exist: $siteRoot")
     else {
-      Site(siteRoot, projectName, projectVersion, projectUrl, ctx.docbase.packages)
-        .generateApiDocs()
-        .copyStaticFiles()
-        .generateHtmlFiles()
-        .generateBlog()
+      def generateSite(outDir: File, baseUrl: String) =
+        Site(siteRoot, outDir, projectName, projectVersion, projectUrl, projectLogo, ctx.docbase.packages, baseUrl)
+          .generateApiDocs()
+          .copyStaticFiles()
+          .generateHtmlFiles()
+          .generateBlog()
 
+      generateSite(outDir, baseUrl)
+      if docSnapshot then generateSite(snapshotOutDir, snapshotBaseUrl)
       ctx.docbase.printSummary()
     }
 

@@ -35,7 +35,7 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
     ctx
   }
 
-  private[this] var myCtx: Context = myInitCtx
+  private var myCtx: Context = myInitCtx
   def currentCtx: Context = myCtx
 
   private val compiler: Compiler = new InteractiveCompiler
@@ -69,8 +69,8 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
       // 9+, we can safely ignore it for now because it's only used for the
       // standard Java library, but this will change once we start supporting
       // adding entries to the modulepath.
-      val zipCps = cps.collect { case cp: ZipArchiveFileLookup[_] => cp }
-      val dirCps = cps.collect { case cp: JFileDirectoryLookup[_] => cp }
+      val zipCps = cps.collect { case cp: ZipArchiveFileLookup[?] => cp }
+      val dirCps = cps.collect { case cp: JFileDirectoryLookup[?] => cp }
       (zipCps, dirCps)
     case _ =>
       (Seq(), Seq())
@@ -79,10 +79,8 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
   // Like in `ZipArchiveFileLookup` we assume that zips are immutable
   private val zipClassPathClasses: Seq[TypeName] = {
     val names = new mutable.ListBuffer[TypeName]
-    zipClassPaths.foreach { zipCp =>
-      val zipFile = new ZipFile(zipCp.zipFile)
-      classesFromZip(zipFile, names)
-    }
+    for (cp <- zipClassPaths)
+      classesFromZip(cp.zipFile, names)
     names
   }
 
@@ -107,12 +105,10 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
     val fromCompilationOutput = {
       val classNames = new mutable.ListBuffer[TypeName]
       val output = ctx.settings.outputDir.value
-      if (output.isDirectory) {
+      if (output.isDirectory)
         classesFromDir(output.jpath, classNames)
-      } else {
-        val zipFile = new ZipFile(output.file)
-        classesFromZip(zipFile, classNames)
-      }
+      else
+        classesFromZip(output.file, classNames)
       classNames.flatMap { cls =>
         treesFromClassName(cls, id)
       }
@@ -159,7 +155,7 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
 
       run.compileSources(List(source))
       run.printSummary()
-      val unit = ctx.run.units.head
+      val unit = if ctx.run.units.nonEmpty then ctx.run.units.head else ctx.run.suspendedUnits.head
       val t = unit.tpdTree
       cleanup(t)
       myOpenedTrees(uri) = topLevelTrees(t, source)
@@ -212,20 +208,26 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
     names
   }
 
-  /** Adds the names of the classes that are defined in `zipFile` to `buffer`. */
-  private def classesFromZip(zipFile: ZipFile, buffer: mutable.ListBuffer[TypeName]): Unit = {
+  /** Adds the names of the classes that are defined in `file` to `buffer`. */
+  private def classesFromZip(file: File, buffer: mutable.ListBuffer[TypeName]): Unit = {
+    val zipFile = new ZipFile(file)
     try {
-      for {
-        entry <- zipFile.stream.toArray((size: Int) => new Array[ZipEntry](size))
-        name = entry.getName
-        tastySuffix <- tastySuffixes.find(name.endsWith)
-      } buffer += name.replace("/", ".").stripSuffix(tastySuffix).toTypeName
+      val entries = zipFile.entries()
+      while (entries.hasMoreElements) {
+        val entry = entries.nextElement()
+        val name = entry.getName
+        tastySuffixes.find(name.endsWith) match {
+          case Some(tastySuffix) =>
+            buffer += name.replace("/", ".").stripSuffix(tastySuffix).toTypeName
+          case _ =>
+        }
+      }
     }
-  finally zipFile.close()
+    finally zipFile.close()
   }
 
   /** Adds the names of the classes that are defined in `dir` to `buffer`. */
-  private def classesFromDir(dir: Path, buffer: mutable.ListBuffer[TypeName]): Unit = {
+  private def classesFromDir(dir: Path, buffer: mutable.ListBuffer[TypeName]): Unit =
     try
       Files.walkFileTree(dir, new SimpleFileVisitor[Path] {
         override def visitFile(path: Path, attrs: BasicFileAttributes) = {
@@ -234,7 +236,8 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
             for {
               tastySuffix <- tastySuffixes
               if name.endsWith(tastySuffix)
-            } {
+            }
+            {
               buffer += dir.relativize(path).toString.replace("/", ".").stripSuffix(tastySuffix).toTypeName
             }
           }
@@ -244,7 +247,6 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
     catch {
       case _: NoSuchFileException =>
     }
-  }
 
   private def topLevelTrees(topTree: Tree, source: SourceFile): List[SourceTree] = {
     val trees = new mutable.ListBuffer[SourceTree]
@@ -293,7 +295,8 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
   }
 
   private def toSource(uri: URI, sourceCode: String): SourceFile = {
-    val virtualFile = new VirtualFile(uri.toString, Paths.get(uri).toString)
+    val path = Paths.get(uri)
+    val virtualFile = new VirtualFile(path.getFileName.toString, path.toString)
     val writer = new BufferedWriter(new OutputStreamWriter(virtualFile.output, "UTF-8"))
     writer.write(sourceCode)
     writer.close()
@@ -308,27 +311,27 @@ class InteractiveDriver(val settings: List[String]) extends Driver {
    * this compiler). In those cases, an un-initialized compiler may crash (for instance if
    * late-compilation is needed).
    */
-  private[this] def initialize(): Unit = {
+  private def initialize(): Unit = {
     val run = compiler.newRun(myInitCtx.fresh)
     myCtx = run.runContext
     run.compileUnits(Nil, myCtx)
   }
-
 }
+
 
 object InteractiveDriver {
   def toUriOption(file: AbstractFile): Option[URI] =
     if (!file.exists)
       None
     else
-      try {
+      try
         // We don't use file.file here since it'll be null
         // for the VirtualFiles created by InteractiveDriver#toSource
         // TODO: To avoid these round trip conversions, we could add an
         // AbstractFile#toUri method and implement it by returning a constant
         // passed as a parameter to a constructor of VirtualFile
         Some(Paths.get(file.path).toUri)
-      } catch {
+      catch {
         case e: InvalidPathException =>
           None
       }

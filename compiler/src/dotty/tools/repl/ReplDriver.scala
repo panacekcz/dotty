@@ -17,7 +17,7 @@ import dotty.tools.dotc.interactive.Completion
 import dotty.tools.dotc.printing.SyntaxHighlighting
 import dotty.tools.dotc.reporting.MessageRendering
 import dotty.tools.dotc.reporting.diagnostic.{Message, MessageContainer}
-import dotty.tools.dotc.util.Positions.Position
+import dotty.tools.dotc.util.Spans.Span
 import dotty.tools.dotc.util.{SourceFile, SourcePosition}
 import dotty.tools.dotc.{CompilationUnit, Driver}
 import dotty.tools.io._
@@ -61,7 +61,7 @@ class ReplDriver(settings: Array[String],
   override def sourcesRequired: Boolean = false
 
   /** Create a fresh and initialized context with IDE mode enabled */
-  private[this] def initialCtx = {
+  private def initialCtx = {
     val rootCtx = initCtx.fresh.addMode(Mode.ReadPositions | Mode.Interactive | Mode.ReadComments)
     rootCtx.setSetting(rootCtx.settings.YcookComments, true)
     val ictx = setup(settings, rootCtx)._2
@@ -78,7 +78,7 @@ class ReplDriver(settings: Array[String],
    *  such, when the user enters `:reset` this method should be called to reset
    *  everything properly
    */
-  protected[this] def resetToInitial(): Unit = {
+  protected def resetToInitial(): Unit = {
     rootCtx = initialCtx
     if (rootCtx.settings.outputDir.isDefault(rootCtx))
       rootCtx = rootCtx.fresh
@@ -87,9 +87,9 @@ class ReplDriver(settings: Array[String],
     rendering = new Rendering(classLoader)
   }
 
-  private[this] var rootCtx: Context = _
-  private[this] var compiler: ReplCompiler = _
-  private[this] var rendering: Rendering = _
+  private var rootCtx: Context = _
+  private var compiler: ReplCompiler = _
+  private var rendering: Rendering = _
 
   // initialize the REPL session as part of the constructor so that once `run`
   // is called, we're in business
@@ -113,7 +113,7 @@ class ReplDriver(settings: Array[String],
       implicit val ctx = state.context
       try {
         val line = terminal.readLine(completer)
-        ParseResult(line)
+        ParseResult(line)(state)
       } catch {
         case _: EndOfFileException |
             _: UserInterruptException => // Ctrl+D or Ctrl+C
@@ -132,15 +132,26 @@ class ReplDriver(settings: Array[String],
   }
 
   final def run(input: String)(implicit state: State): State = withRedirectedOutput {
-    val parsed = ParseResult(input)(state.context)
+    val parsed = ParseResult(input)(state)
     interpret(parsed)
   }
 
   // TODO: i5069
   final def bind(name: String, value: Any)(implicit state: State): State = state
 
-  private def withRedirectedOutput(op: => State): State =
-    Console.withOut(out) { Console.withErr(out) { op } }
+  private def withRedirectedOutput(op: => State): State = {
+    val savedOut = System.out
+    val savedErr = System.err
+    try {
+      System.setOut(out)
+      System.setErr(out)
+      op
+    }
+    finally {
+      System.setOut(savedOut)
+      System.setErr(savedErr)
+    }
+  }
 
   private def newRun(state: State) = {
     val run = compiler.newRun(rootCtx.fresh.setReporter(newStoreReporter), state)
@@ -148,8 +159,8 @@ class ReplDriver(settings: Array[String],
   }
 
   /** Extract possible completions at the index of `cursor` in `expr` */
-  protected[this] final def completions(cursor: Int, expr: String, state0: State): List[Candidate] = {
-    def makeCandidate(completion: Completion)(implicit ctx: Context) = {
+  protected final def completions(cursor: Int, expr: String, state0: State): List[Candidate] = {
+    def makeCandidate(completion: Completion) = {
       val displ = completion.label
       new Candidate(
         /* value    = */ displ,
@@ -165,11 +176,11 @@ class ReplDriver(settings: Array[String],
     compiler
       .typeCheck(expr, errorsAllowed = true)
       .map { tree =>
-        val file = new SourceFile("<completions>", expr)
-        val unit = new CompilationUnit(file)
+        val file = SourceFile.virtual("<completions>", expr)
+        val unit = CompilationUnit(file)(state.context)
         unit.tpdTree = tree
         implicit val ctx = state.context.fresh.setCompilationUnit(unit)
-        val srcPos = SourcePosition(file, Position(cursor))
+        val srcPos = SourcePosition(file, Span(cursor))
         val (_, completions) = Completion.completions(srcPos)
         completions.map(makeCandidate)
       }
@@ -194,7 +205,9 @@ class ReplDriver(settings: Array[String],
       case _ => // new line, empty tree
         state
     }
-    out.println()
+    implicit val ctx: Context = newState.context
+    if (!ctx.settings.XreplDisableDisplay.value)
+      out.println()
     newState
   }
 
@@ -208,7 +221,10 @@ class ReplDriver(settings: Array[String],
     def extractTopLevelImports(ctx: Context): List[tpd.Import] =
       ctx.phases.collectFirst { case phase: CollectTopLevelImports => phase.imports }.get
 
-    implicit val state = newRun(istate)
+    implicit val state = {
+      val state0 = newRun(istate)
+      state0.copy(context = state0.context.withSource(parsed.source))
+    }
     compiler
       .compile(parsed)
       .fold(
@@ -224,7 +240,11 @@ class ReplDriver(settings: Array[String],
 
             val warnings = newState.context.reporter.removeBufferedMessages(newState.context)
             displayErrors(warnings)(newState) // display warnings
-            displayDefinitions(unit.tpdTree, newestWrapper)(newStateWithImports)
+            implicit val ctx = newState.context
+            if (!ctx.settings.XreplDisableDisplay.value)
+              displayDefinitions(unit.tpdTree, newestWrapper)(newStateWithImports)
+            else
+              newStateWithImports
         }
       )
   }
@@ -248,20 +268,22 @@ class ReplDriver(settings: Array[String],
       val info = symbol.info
       val defs =
         info.bounds.hi.finalResultType
-          .membersBasedOnFlags(Method, Accessor | ParamAccessor | Synthetic | Private)
+          .membersBasedOnFlags(required = Method, excluded = Accessor | ParamAccessor | Synthetic | Private)
           .filterNot { denot =>
             denot.symbol.owner == defn.AnyClass ||
             denot.symbol.owner == defn.ObjectClass ||
             denot.symbol.isConstructor
           }
+          .sortBy(_.name)
 
       val vals =
         info.fields
-          .filterNot(_.symbol.is(ParamAccessor | Private | Synthetic | Module))
+          .filterNot(_.symbol.isOneOf(ParamAccessor | Private | Synthetic | Artifact | Module))
           .filter(_.symbol.name.is(SimpleNameKind))
+          .sortBy(_.name)
 
       val typeAliases =
-        info.bounds.hi.typeMembers.filter(_.symbol.info.isTypeAlias)
+        info.bounds.hi.typeMembers.filter(_.symbol.info.isTypeAlias).sortBy(_.name)
 
       (
         typeAliases.map("// defined alias " + _.symbol.showUser) ++
@@ -286,8 +308,7 @@ class ReplDriver(settings: Array[String],
       }
 
 
-    ctx.atPhase(ctx.typerPhase.next) { implicit ctx =>
-
+    ctx.atPhase(ctx.typerPhase.next) {
       // Display members of wrapped module:
       tree.symbol.info.memberClasses
         .find(_.symbol.name == newestWrapper.moduleClassName)

@@ -1,4 +1,5 @@
-package dotty.tools.dotc.printing
+package dotty.tools.dotc
+package printing
 
 import dotty.tools.dotc.ast.untpd
 import dotty.tools.dotc.core.Contexts.Context
@@ -7,7 +8,7 @@ import dotty.tools.dotc.parsing.Parsers.Parser
 import dotty.tools.dotc.parsing.Scanners.Scanner
 import dotty.tools.dotc.parsing.Tokens._
 import dotty.tools.dotc.reporting.Reporter
-import dotty.tools.dotc.util.Positions.Position
+import dotty.tools.dotc.util.Spans.Span
 import dotty.tools.dotc.util.SourceFile
 
 import java.util.Arrays
@@ -32,23 +33,26 @@ object SyntaxHighlighting {
     def freshCtx = ctx.fresh.setReporter(Reporter.NoReporter)
     if (in.isEmpty || ctx.settings.color.value == "never") in
     else {
-      implicit val ctx = freshCtx
-      val source = new SourceFile("<highlighting>", in)
+      val source = SourceFile.virtual("<highlighting>", in)
+
+      implicit val ctx = freshCtx.setCompilationUnit(CompilationUnit(source, mustExist = false)(freshCtx))
+
       val colorAt = Array.fill(in.length)(NoColor)
 
       def highlightRange(from: Int, to: Int, color: String) =
         Arrays.fill(colorAt.asInstanceOf[Array[AnyRef]], from, to, color)
 
-      def highlightPosition(pos: Position, color: String) = if (pos.exists) {
-        if (pos.start < 0 || pos.end > in.length) {
+      def highlightPosition(span: Span, color: String) = if (span.exists)
+        if (span.start < 0 || span.end > in.length) {
           if (debug)
-            println(s"Trying to highlight erroneous position $pos. Input size: ${in.length}")
+            println(s"Trying to highlight erroneous position $span. Input size: ${in.length}")
         }
         else
-          highlightRange(pos.start, pos.end, color)
-      }
+          highlightRange(span.start, span.end, color)
 
-      val scanner = new Scanner(source)
+      val scanner = new Scanner(source) {
+        override protected def printState() = ()
+      }
       while (scanner.token != EOF) {
         val start = scanner.offset
         val token = scanner.token
@@ -78,8 +82,8 @@ object SyntaxHighlighting {
         }
       }
 
-      for (pos <- scanner.commentPositions)
-        highlightPosition(pos, CommentColor)
+      for (span <- scanner.commentSpans)
+        highlightPosition(span, CommentColor)
 
       object TreeHighlighter extends untpd.UntypedTreeTraverser {
         import untpd._
@@ -92,7 +96,7 @@ object SyntaxHighlighting {
 
         def highlightAnnotations(tree: MemberDef): Unit =
           for (annotation <- tree.rawMods.annotations)
-            highlightPosition(annotation.pos, AnnotationColor)
+            highlightPosition(annotation.span, AnnotationColor)
 
         def highlight(trees: List[Tree])(implicit ctx: Context): Unit =
           trees.foreach(traverse)
@@ -103,14 +107,14 @@ object SyntaxHighlighting {
               ()
             case tree: ValOrDefDef =>
               highlightAnnotations(tree)
-              highlightPosition(tree.namePos, ValDefColor)
+              highlightPosition(tree.nameSpan, ValDefColor)
             case tree: MemberDef /* ModuleDef | TypeDef */ =>
               highlightAnnotations(tree)
-              highlightPosition(tree.namePos, TypeColor)
+              highlightPosition(tree.nameSpan, TypeColor)
             case tree: Ident if tree.isType =>
-              highlightPosition(tree.pos, TypeColor)
+              highlightPosition(tree.span, TypeColor)
             case _: TypTree =>
-              highlightPosition(tree.pos, TypeColor)
+              highlightPosition(tree.span, TypeColor)
             case _ =>
           }
           traverseChildren(tree)

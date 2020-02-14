@@ -3,14 +3,15 @@ package model
 package comment
 
 import dotty.tools.dottydoc.util.syntax._
-import dotty.tools.dotc.util.Positions._
+import dotty.tools.dotc.util.Spans._
 import dotty.tools.dotc.core.Symbols._
 import dotty.tools.dotc.core.Contexts.Context
 import dotty.tools.dotc.core.Decorators._
+import dotty.tools.dotc.printing.Formatting.hl
 import scala.collection.mutable
 import dotty.tools.dotc.config.Printers.dottydoc
 import scala.util.matching.Regex
-import com.vladsch.flexmark.ast.{ Node => MarkdownNode }
+import com.vladsch.flexmark.util.ast.{ Node => MarkdownNode }
 import com.vladsch.flexmark.parser.{ Parser => MarkdownParser }
 
 trait CommentParser extends util.MemberLookup {
@@ -21,14 +22,14 @@ trait CommentParser extends util.MemberLookup {
    * @param packages     all packages parsed by Scaladoc tool, used for lookup
    * @param cleanComment a cleaned comment to be parsed
    * @param src          the raw comment source string.
-   * @param pos          the position of the comment in source.
+   * @param span         the position of the comment in source.
    */
   def parse(
     entity: Entity,
     packages: Map[String, Package],
     comment: List[String],
     src: String,
-    pos: Position,
+    span: Span,
     site: Symbol = NoSymbol
   )(implicit ctx: Context): ParsedComment = {
 
@@ -159,7 +160,7 @@ trait CommentParser extends util.MemberLookup {
             bodyTags.keys.toSeq flatMap {
               case stk: SymbolTagKey if (stk.name == key.name) => Some(stk)
               case stk: SimpleTagKey if (stk.name == key.name) =>
-                dottydoc.println(s"$pos: tag '@${stk.name}' must be followed by a symbol name")
+                dottydoc.println(s"$span: tag '@${stk.name}' must be followed by a symbol name")
                 None
               case _ => None
             }
@@ -167,7 +168,7 @@ trait CommentParser extends util.MemberLookup {
             for (key <- keys) yield {
               val bs = (bodyTags remove key).get
               if (bs.length > 1)
-                dottydoc.println(s"$pos: only one '@${key.name}' tag for symbol ${key.symbol} is allowed")
+                dottydoc.println(s"$span: only one '@${key.name}' tag for symbol ${key.symbol} is allowed")
               (key.symbol, bs.head)
             }
           Map.empty[String, String] ++ pairs
@@ -197,12 +198,12 @@ trait CommentParser extends util.MemberLookup {
         )
 
         for ((key, _) <- bodyTags) ctx.docbase.warn(
-          hl"Tag '${"@" + key.name}' is not recognised",
+          em"Tag '${hl("@" + key.name)}' is not recognised",
           // FIXME: here the position is stretched out over the entire comment,
           // with the point being at the very end. This ensures that the entire
           // comment will be visible in error reporting. A more fine-grained
           // reporting would be amazing here.
-          entity.symbol.sourcePosition(Position(pos.start, pos.end, pos.end))
+          entity.symbol.sourcePosition(Span(span.start, span.end, span.end))
         )
 
         cmt
@@ -236,7 +237,7 @@ trait CommentParser extends util.MemberLookup {
     entity: Entity,
     packages: Map[String, Package],
     string: String,
-    pos: Position,
+    span: Span,
     site: Symbol
-  )(implicit ctx: Context): Body = new WikiParser(entity, packages, string, pos, site).document()
+  )(implicit ctx: Context): Body = new WikiParser(entity, packages, string, span, site).document()
 }

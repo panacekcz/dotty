@@ -61,7 +61,7 @@ class DocASTPhase extends Phase {
           }.toList
 
         // don't add privates, synthetics or class parameters (i.e. value class constructor val)
-        val vals = sym.info.fields.filterNot(_.symbol.is(Flags.ParamAccessor | Flags.Private | Flags.Synthetic)).map { value =>
+        val vals = sym.info.fields.filterNot(_.symbol.isOneOf(Flags.ParamAccessor | Flags.Private | Flags.Synthetic)).map { value =>
           val kind = if (value.symbol.is(Flags.Mutable)) "var" else "val"
           ValImpl(
             value.symbol,
@@ -89,7 +89,7 @@ class DocASTPhase extends Phase {
       /** type alias */
       case t: TypeDef if !t.isClassDef =>
         val sym = t.symbol
-        if (sym.is(Flags.Synthetic | Flags.Param))
+        if (sym.isOneOf(Flags.Synthetic | Flags.Param))
           Nil
         else {
           val tparams = t.rhs.tpe match {
@@ -129,7 +129,7 @@ class DocASTPhase extends Phase {
         ValImpl(v.symbol, annotations(v.symbol), v.name.decode.toString, flags(v), path(v.symbol), returnType(v.tpt.tpe), kind) :: Nil
 
       case x => {
-        ctx.docbase.debug(s"Found unwanted entity: $x (${x.pos},\n${x.show}")
+        ctx.docbase.debug(s"Found unwanted entity: $x (${x.span},\n${x.show}")
         Nil
       }
     }

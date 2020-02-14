@@ -10,7 +10,7 @@ import collection.mutable
 /** Realizability status */
 object CheckRealizable {
 
-  abstract class Realizability(val msg: String) {
+  sealed abstract class Realizability(val msg: String) {
     def andAlso(other: => Realizability): Realizability =
       if (this == Realizable) other else this
     def mapError(f: Realizability => Realizability): Realizability =
@@ -20,8 +20,6 @@ object CheckRealizable {
   object Realizable extends Realizability("")
 
   object NotConcrete extends Realizability(" is not a concrete type")
-
-  object NotStable extends Realizability(" is not a stable reference")
 
   class NotFinal(sym: Symbol)(implicit ctx: Context)
   extends Realizability(i" refers to nonfinal $sym")
@@ -49,10 +47,18 @@ object CheckRealizable {
   def boundsRealizability(tp: Type)(implicit ctx: Context): Realizability =
     new CheckRealizable().boundsRealizability(tp)
 
-  private val LateInitialized = Lazy | Erased,
+  private val LateInitializedFlags = Lazy | Erased
 }
 
-/** Compute realizability status */
+/** Compute realizability status.
+  *
+  * A type T is realizable iff it is inhabited by non-null values. This ensures that its type members have good bounds
+  * (in the sense from DOT papers). A type projection T#L is legal if T is realizable, and can be understood as
+  * Scala 2's `v.L forSome { val v: T }`.
+  *
+  * In general, a realizable type can have multiple inhabitants, hence it need not be stable (in the sense of
+  * Type.isStable).
+  */
 class CheckRealizable(implicit ctx: Context) {
   import CheckRealizable._
 
@@ -64,22 +70,45 @@ class CheckRealizable(implicit ctx: Context) {
   /** Is symbol's definitition a lazy or erased val?
    *  (note we exclude modules here, because their realizability is ensured separately)
    */
-  private def isLateInitialized(sym: Symbol) = sym.is(LateInitialized, butNot = Module)
+  private def isLateInitialized(sym: Symbol) = sym.isOneOf(LateInitializedFlags, butNot = Module)
 
   /** The realizability status of given type `tp`*/
   def realizability(tp: Type): Realizability = tp.dealias match {
+    /*
+     * A `TermRef` for a path `p` is realizable if
+     * - `p`'s type is stable and realizable, or
+     * - its underlying path is idempotent (that is, *stable*), total, and not null.
+     * We don't check yet the "not null" clause: that will require null-safety checking.
+     *
+     * We assume that stability of tp.prefix is checked elsewhere, since that's necessary for the path to be legal in
+     * the first place.
+     */
     case tp: TermRef =>
       val sym = tp.symbol
-      if (sym.is(Stable)) realizability(tp.prefix)
+      lazy val tpInfoRealizable = realizability(tp.info)
+      if (sym.is(StableRealizable)) realizability(tp.prefix)
       else {
         val r =
-          if (!sym.isStable) NotStable
-          else if (!isLateInitialized(sym)) Realizable
-          else if (!sym.isEffectivelyFinal) new NotFinal(sym)
-          else realizability(tp.info).mapError(r => new ProblemInUnderlying(tp.info, r))
+          if (sym.isStableMember && !isLateInitialized(sym))
+            // it's realizable because we know that a value of type `tp` has been created at run-time
+            Realizable
+          else if (!sym.isEffectivelyFinal)
+            // it's potentially not realizable since it might be overridden with a member of nonrealizable type
+            new NotFinal(sym)
+          else
+            // otherwise we need to look at the info to determine realizability
+            // roughly: it's realizable if the info does not have bad bounds
+            tpInfoRealizable.mapError(r => new ProblemInUnderlying(tp, r))
         r andAlso {
-          sym.setFlag(Stable)
+          if (sym.isStableMember) sym.setFlag(StableRealizable) // it's known to be stable and realizable
           realizability(tp.prefix)
+        } mapError { r =>
+          // A mutable path is in fact stable and realizable if it has a realizable singleton type.
+          if (tp.info.isStable && tpInfoRealizable == Realizable) {
+            sym.setFlag(StableRealizable)
+            Realizable
+          }
+          else r
         }
       }
     case _: SingletonType | NoPrefix =>
@@ -117,15 +146,10 @@ class CheckRealizable(implicit ctx: Context) {
    */
   private def boundsRealizability(tp: Type) = {
 
-    def isOpaqueCompanionThis = tp match {
-      case tp: ThisType => tp.cls.isOpaqueCompanion
-      case _ => false
-    }
-
     val memberProblems =
       for {
         mbr <- tp.nonClassTypeMembers
-        if !(mbr.info.loBound <:< mbr.info.hiBound) && !mbr.symbol.isOpaqueHelper
+        if !(mbr.info.loBound <:< mbr.info.hiBound)
       }
       yield new HasProblemBounds(mbr.name, mbr.info)
 
@@ -134,7 +158,7 @@ class CheckRealizable(implicit ctx: Context) {
         name <- refinedNames(tp)
         if (name.isTypeName)
         mbr <- tp.member(name).alternatives
-        if !(mbr.info.loBound <:< mbr.info.hiBound) && !isOpaqueCompanionThis
+        if !(mbr.info.loBound <:< mbr.info.hiBound)
       }
       yield new HasProblemBounds(name, mbr.info)
 
@@ -150,10 +174,10 @@ class CheckRealizable(implicit ctx: Context) {
     val baseProblems =
       tp.baseClasses.map(_.baseTypeOf(tp)).flatMap(baseTypeProblems)
 
-    ((((Realizable: Realizability)
-      /: memberProblems)(_ andAlso _)
-      /: refinementProblems)(_ andAlso _)
-      /: baseProblems)(_ andAlso _)
+    baseProblems.foldLeft(
+      refinementProblems.foldLeft(
+        memberProblems.foldLeft(
+          Realizable: Realizability)(_ andAlso _))(_ andAlso _))(_ andAlso _)
   }
 
   /** `Realizable` if all of `tp`'s non-strict fields have realizable types,
@@ -162,7 +186,7 @@ class CheckRealizable(implicit ctx: Context) {
   private def memberRealizability(tp: Type) = {
     def checkField(sofar: Realizability, fld: SingleDenotation): Realizability =
       sofar andAlso {
-        if (checkedFields.contains(fld.symbol) || fld.symbol.is(Private | Mutable | LateInitialized))
+        if (checkedFields.contains(fld.symbol) || fld.symbol.isOneOf(Private | Mutable | LateInitializedFlags))
           // if field is private it cannot be part of a visible path
           // if field is mutable it cannot be part of a path
           // if field is lazy or erased it does not need to be initialized when the owning object is
@@ -178,7 +202,7 @@ class CheckRealizable(implicit ctx: Context) {
       // Reason: An embedded field could well be nullable, which means it
       // should not be part of a path and need not be checked; but we cannot recognize
       // this situation until we have a typesystem that tracks nullability.
-      ((Realizable: Realizability) /: tp.fields)(checkField)
+      tp.fields.foldLeft(Realizable: Realizability)(checkField)
     else
       Realizable
   }

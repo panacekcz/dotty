@@ -1,8 +1,9 @@
 object opaquetypes {
-
   opaque val x: Int = 1 // error
 
   opaque class Foo // error
+
+  opaque object Foo // error
 
   opaque type T // error
 
@@ -12,12 +13,15 @@ object opaquetypes {
 
   opaque type O = String
 
-  val s: O = "" // error
+  val s: O = "" // should now be OK
 
   object O {
     val s: O = "" // should be OK
   }
 
+  def foo() = {
+    opaque type X = Int   // error
+  }
 }
 
 object logs {
@@ -42,7 +46,10 @@ object logs {
       def *(that: Logarithm): Logarithm = Logarithm(`this` + that)
     }
   }
+}
 
+object Test {
+  import logs._
   val l = Logarithm(2.0)
   val d: Double = l       // error: found: Logarithm, required: Double
   val l2: Logarithm = 1.0 // error: found: Double, required: Logarithm

@@ -4,11 +4,11 @@ package model
 package comment
 
 import dotc.core.Contexts.Context
-import dotc.util.Positions._
+import dotc.util.Spans._
 import dotty.tools.dottydoc.util.syntax._
 import util.MemberLookup
 
-import com.vladsch.flexmark.ast.{ Node => MarkdownNode }
+import com.vladsch.flexmark.util.ast.{ Node => MarkdownNode}
 import com.vladsch.flexmark.html.HtmlRenderer
 import com.vladsch.flexmark.parser.Parser
 import com.vladsch.flexmark.util.sequence.CharSubSequence
@@ -17,7 +17,9 @@ object HtmlParsers {
 
   implicit class StringToMarkdown(val text: String) extends AnyVal {
     def toMarkdown(origin: Entity)(implicit ctx: Context): MarkdownNode = {
-      import com.vladsch.flexmark.ast.{ Link, Visitor, VisitHandler, NodeVisitor }
+      import com.vladsch.flexmark.ast.Link
+      import com.vladsch.flexmark.util.ast.{Visitor, VisitHandler, NodeVisitor }
+
 
       val inlineToHtml = InlineToHtml(origin)
 
@@ -70,8 +72,8 @@ object HtmlParsers {
   }
 
   implicit class StringToWiki(val text: String) extends AnyVal {
-    def toWiki(origin: Entity, packages: Map[String, Package], pos: Position): Body =
-      new WikiParser(origin, packages, text, pos, origin.symbol).document()
+    def toWiki(origin: Entity, packages: Map[String, Package], span: Span): Body =
+      new WikiParser(origin, packages, text, span, origin.symbol).document()
   }
 
   implicit class BodyToHtml(val body: Body) extends AnyVal {

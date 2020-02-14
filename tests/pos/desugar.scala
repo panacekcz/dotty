@@ -70,7 +70,7 @@ object desugar {
   }
 
   object misc {
-    'hello
+    Symbol("hello")
     s"this is a $x + ${x + y} string"
     type ~[X, Y] = Tuple2[X, Y]
     val pair: Int ~ String = 1 -> "abc"
@@ -82,7 +82,7 @@ object desugar {
     def bar(x: => Int) = x
     (x + y) + 1
     while (x < 10) x += 1
-    do x -= 1 while (x > 0)
+    while ({ x -= 1 ; x > 0 }) ()
   }
 
 }

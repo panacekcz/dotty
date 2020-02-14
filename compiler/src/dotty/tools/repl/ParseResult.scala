@@ -1,13 +1,14 @@
 package dotty.tools
 package repl
 
-import dotc.reporting.diagnostic.MessageContainer
+import dotc.CompilationUnit
+import dotc.ast.untpd
 import dotc.core.Contexts.Context
+import dotc.core.StdNames.str
 import dotc.parsing.Parsers.Parser
 import dotc.parsing.Tokens
+import dotc.reporting.diagnostic.MessageContainer
 import dotc.util.SourceFile
-import dotc.ast.untpd
-
 
 import scala.annotation.internal.sharable
 
@@ -15,7 +16,7 @@ import scala.annotation.internal.sharable
 sealed trait ParseResult
 
 /** An error free parsing resulting in a list of untyped trees */
-case class Parsed(sourceCode: String, trees: List[untpd.Tree]) extends ParseResult
+case class Parsed(source: SourceFile, trees: List[untpd.Tree]) extends ParseResult
 
 /** A parsing result containing syntax `errors` */
 case class SyntaxErrors(sourceCode: String,
@@ -106,18 +107,17 @@ case object Help extends Command {
 
 object ParseResult {
 
-  @sharable private[this] val CommandExtract = """(:[\S]+)\s*(.*)""".r
+  @sharable private val CommandExtract = """(:[\S]+)\s*(.*)""".r
 
-  private def parseStats(sourceCode: String)(implicit ctx: Context): List[untpd.Tree] = {
-    val source = new SourceFile("<console>", sourceCode)
-    val parser = new Parser(source)
+  private def parseStats(implicit ctx: Context): List[untpd.Tree] = {
+    val parser = new Parser(ctx.source)
     val stats = parser.blockStatSeq()
     parser.accept(Tokens.EOF)
     stats
   }
 
-  /** Extract a `ParseResult` from the string `sourceCode` */
-  def apply(sourceCode: String)(implicit ctx: Context): ParseResult =
+  def apply(source: SourceFile)(implicit state: State): ParseResult = {
+    val sourceCode = source.content().mkString
     sourceCode match {
       case "" => Newline
       case CommandExtract(cmd, arg) => cmd match {
@@ -131,8 +131,10 @@ object ParseResult {
         case _ => UnknownCommand(cmd)
       }
       case _ =>
+        implicit val ctx: Context = state.context
+
         val reporter = newStoreReporter
-        val stats = parseStats(sourceCode)(ctx.fresh.setReporter(reporter))
+        val stats = parseStats(state.context.fresh.setReporter(reporter).withSource(source))
 
         if (reporter.hasErrors)
           SyntaxErrors(
@@ -140,24 +142,33 @@ object ParseResult {
             reporter.removeBufferedMessages,
             stats)
         else
-          Parsed(sourceCode, stats)
+          Parsed(source, stats)
     }
+  }
 
-  /** Check if the input is incomplete
+  def apply(sourceCode: String)(implicit state: State): ParseResult =
+    apply(SourceFile.virtual(str.REPL_SESSION_LINE + (state.objectIndex + 1), sourceCode))
+
+  /** Check if the input is incomplete.
    *
    *  This can be used in order to check if a newline can be inserted without
-   *  having to evaluate the expression
+   *  having to evaluate the expression.
    */
   def isIncomplete(sourceCode: String)(implicit ctx: Context): Boolean =
     sourceCode match {
       case CommandExtract(_) | "" => false
       case _ => {
         val reporter = newStoreReporter
+        val source   = SourceFile.virtual("<incomplete-handler>", sourceCode)
+        val unit     = CompilationUnit(source, mustExist = false)
+        val localCtx = ctx.fresh
+                          .setCompilationUnit(unit)
+                          .setReporter(reporter)
         var needsMore = false
-        reporter.withIncompleteHandler(_ => _ => needsMore = true) {
-          parseStats(sourceCode)(ctx.fresh.setReporter(reporter))
-          !reporter.hasErrors && needsMore
+        reporter.withIncompleteHandler((_, _) => needsMore = true) {
+          parseStats(localCtx)
         }
+        !reporter.hasErrors && needsMore
       }
     }
 }

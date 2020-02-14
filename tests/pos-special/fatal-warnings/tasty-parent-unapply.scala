@@ -6,25 +6,25 @@ object Macros {
 
 
   def impl(reflect: Reflection): Unit = {
-    import reflect._
+    import reflect.{_, given _}
 
-    def foo(tree: Tree, term: Term, typeTree: TypeTree, parent: TermOrTypeTree) = {
+    def foo(tree: Tree, term: Term, typeTree: TypeTree, parent: Tree) = {
 
       tree match {
-        case IsTerm(tree) =>
+        case tree: Tree =>
       }
 
       term match {
-        case IsTerm(term) =>
+        case term: Term =>
       }
 
       typeTree match {
-        case IsTypeTree(typeTree) =>
+        case typeTree: TypeTree =>
       }
 
       parent match {
-        case IsTerm(typeTree) =>
-        case IsTypeTree(typeTree) =>
+        case typeTree: Term =>
+        case typeTree: TypeTree =>
       }
 
     }

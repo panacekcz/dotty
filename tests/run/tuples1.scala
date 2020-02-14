@@ -25,8 +25,8 @@ object Test extends App {
   val a6_4 = x6(4); val a6_4c: String = a6_4; println(s"a6_4 = $a6_4")
   val a8_0 = x8(0); val a8_0c: String = a8_0; println(s"a8_0 = $a8_0")
   val c0_0 = x0 ++ x0; val c0_0c: Unit = c0_0; println(s"c0_0 = $c0_0")
-  val c0_1 = x0 ++ x1; val c0_1c: Int *: Unit = c0_1c; println(s"c0_1 = $c0_1")
-  val c1_0 = x1 ++ x0; val c1_0c: Int *: Unit = c1_0c; println(s"c1_0 = $c1_0")
+  val c0_1 = x0 ++ x1; val c0_1c: Int *: Unit = c0_1; println(s"c0_1 = $c0_1")
+  val c1_0 = x1 ++ x0; val c1_0c: Int *: Unit = c1_0; println(s"c1_0 = $c1_0")
   val c0_4 = x0 ++ x4; val c0_4c: (String, Int, String, Int) = c0_4; println(s"c0_4 = $c0_4")
   val c4_0 = x4 ++ x0; val c4_0c: (String, Int, String, Int) = c4_0; println(s"c4_0 = $c4_0")
   val c1_1 = x1 ++ x1; val c1_1c: (Int, Int) = c1_1; println(s"c1_1 = $c1_1")
@@ -62,7 +62,8 @@ object Test extends App {
   def head2[X <: NonEmptyTuple](x: X): Tuple.Head[X] = x.head
 
   val hd1: Int = head1(x3)
-  val hd2: Int = head2(x3)
+  // Without an explicit type parameter type inferance infers Nothing here.
+  val hd2: Int = head2[x3.type](x3)
 
   def tail1(x: NonEmptyTuple): Tuple.Tail[x.type] = x.tail
   def tail2[X <: NonEmptyTuple](x: X): Tuple.Tail[X] = x.tail

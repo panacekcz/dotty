@@ -49,6 +49,14 @@ class ExtractDependencies extends Phase {
 
   override def phaseName: String = "sbt-deps"
 
+  override def isRunnable(implicit ctx: Context): Boolean = {
+    def forceRun = ctx.settings.YdumpSbtInc.value || ctx.settings.YforceSbtPhases.value
+    super.isRunnable && (ctx.sbtCallback != null || forceRun)
+  }
+
+  // Check no needed. Does not transform trees
+  override def isCheckable: Boolean = false
+
   // This phase should be run directly after `Frontend`, if it is run after
   // `PostTyper`, some dependencies will be lost because trees get simplified.
   // See the scripted test `constants` for an example where this matters.
@@ -56,45 +64,39 @@ class ExtractDependencies extends Phase {
 
   override def run(implicit ctx: Context): Unit = {
     val unit = ctx.compilationUnit
-    val dumpInc = ctx.settings.YdumpSbtInc.value
-    val forceRun = dumpInc || ctx.settings.YforceSbtPhases.value
-    val shouldRun = !unit.isJava && (ctx.sbtCallback != null || forceRun)
+    val collector = new ExtractDependenciesCollector
+    collector.traverse(unit.tpdTree)
 
-    if (shouldRun) {
-      val collector = new ExtractDependenciesCollector
-      collector.traverse(unit.tpdTree)
+    if (ctx.settings.YdumpSbtInc.value) {
+      val deps = collector.dependencies.map(_.toString).toArray[Object]
+      val names = collector.usedNames.map { case (clazz, names) => s"$clazz: $names" }.toArray[Object]
+      Arrays.sort(deps)
+      Arrays.sort(names)
 
-      if (dumpInc) {
-        val deps = collector.dependencies.map(_.toString).toArray[Object]
-        val names = collector.usedNames.map { case (clazz, names) => s"$clazz: $names" }.toArray[Object]
-        Arrays.sort(deps)
-        Arrays.sort(names)
+      val pw = io.File(unit.source.file.jpath).changeExtension("inc").toFile.printWriter()
+      // val pw = Console.out
+      try {
+        pw.println("Used Names:")
+        pw.println("===========")
+        names.foreach(pw.println)
+        pw.println()
+        pw.println("Dependencies:")
+        pw.println("=============")
+        deps.foreach(pw.println)
+      } finally pw.close()
+    }
 
-        val pw = io.File(unit.source.file.jpath).changeExtension("inc").toFile.printWriter()
-        // val pw = Console.out
-        try {
-          pw.println("Used Names:")
-          pw.println("===========")
-          names.foreach(pw.println)
-          pw.println()
-          pw.println("Dependencies:")
-          pw.println("=============")
-          deps.foreach(pw.println)
-        } finally pw.close()
+    if (ctx.sbtCallback != null) {
+      collector.usedNames.foreach {
+        case (clazz, usedNames) =>
+          val className = classNameAsString(clazz)
+          usedNames.names.foreach {
+            case (usedName, scopes) =>
+              ctx.sbtCallback.usedName(className, usedName.toString, scopes)
+          }
       }
 
-      if (ctx.sbtCallback != null) {
-        collector.usedNames.foreach {
-          case (clazz, usedNames) =>
-            val className = classNameAsString(clazz)
-            usedNames.names.foreach {
-              case (usedName, scopes) =>
-                ctx.sbtCallback.usedName(className, usedName.toString, scopes)
-            }
-        }
-
-        collector.dependencies.foreach(recordDependency)
-      }
+      collector.dependencies.foreach(recordDependency)
     }
   }
 
@@ -199,8 +201,8 @@ private final class UsedNamesInClass {
 private class ExtractDependenciesCollector extends tpd.TreeTraverser { thisTreeTraverser =>
   import tpd._
 
-  private[this] val _usedNames = new mutable.HashMap[Symbol, UsedNamesInClass]
-  private[this] val _dependencies = new mutable.HashSet[ClassDependency]
+  private val _usedNames = new mutable.HashMap[Symbol, UsedNamesInClass]
+  private val _dependencies = new mutable.HashSet[ClassDependency]
 
   /** The names used in this class, this does not include names which are only
    *  defined and not referenced.
@@ -214,7 +216,7 @@ private class ExtractDependenciesCollector extends tpd.TreeTraverser { thisTreeT
   /** Top level import dependencies are registered as coming from a first top level
    *  class/trait/object declared in the compilation unit. If none exists, issue warning.
    */
-  private[this] var _responsibleForImports: Symbol = _
+  private var _responsibleForImports: Symbol = _
   private def responsibleForImports(implicit ctx: Context) = {
     def firstClassOrModule(tree: Tree) = {
       val acc = new TreeAccumulator[Symbol] {
@@ -236,13 +238,13 @@ private class ExtractDependenciesCollector extends tpd.TreeTraverser { thisTreeT
           ctx.warning("""|No class, trait or object is defined in the compilation unit.
                          |The incremental compiler cannot record the dependency information in such case.
                          |Some errors like unused import referring to a non-existent class might not be reported.
-                         |""".stripMargin, tree.pos)
+                         |""".stripMargin, tree.sourcePos)
     }
     _responsibleForImports
   }
 
-  private[this] var lastOwner: Symbol = _
-  private[this] var lastDepSource: Symbol = _
+  private var lastOwner: Symbol = _
+  private var lastDepSource: Symbol = _
 
   /**
    * Resolves dependency source (that is, the closest non-local enclosing
@@ -324,8 +326,8 @@ private class ExtractDependenciesCollector extends tpd.TreeTraverser { thisTreeT
 
   private def ignoreDependency(sym: Symbol)(implicit ctx: Context) =
     !sym.exists ||
-    sym.unforcedIsAbsent || // ignore dependencies that have a symbol but do not exist.
-                            // e.g. java.lang.Object companion object
+    sym.isAbsent(canForce = false) || // ignore dependencies that have a symbol but do not exist.
+                                      // e.g. java.lang.Object companion object
     sym.isEffectiveRoot ||
     sym.isAnonymousFunction ||
     sym.isAnonymousClass
@@ -333,27 +335,22 @@ private class ExtractDependenciesCollector extends tpd.TreeTraverser { thisTreeT
   /** Traverse the tree of a source file and record the dependencies and used names which
    *  can be retrieved using `dependencies` and`usedNames`.
    */
-  override def traverse(tree: Tree)(implicit ctx: Context): Unit = {
+  override def traverse(tree: Tree)(implicit ctx: Context): Unit = try {
     tree match {
       case Match(selector, _) =>
         addPatMatDependency(selector.tpe)
       case Import(expr, selectors) =>
-        def lookupImported(name: Name) = expr.tpe.member(name).symbol
+        def lookupImported(name: Name) =
+          expr.tpe.member(name).symbol
         def addImported(name: Name) = {
           // importing a name means importing both a term and a type (if they exist)
           addMemberRefDependency(lookupImported(name.toTermName))
           addMemberRefDependency(lookupImported(name.toTypeName))
         }
-        selectors.foreach {
-          case Ident(name) =>
-            addImported(name)
-          case Thicket(Ident(name) :: Ident(rename) :: Nil) =>
-            addImported(name)
-            if (rename ne nme.WILDCARD) {
-              addUsedName(rename, UseScope.Default)
-            }
-          case _ =>
-        }
+        for sel <- selectors if !sel.isWildcard do
+          addImported(sel.name)
+          if sel.rename != sel.name then
+            addUsedName(sel.rename, UseScope.Default)
       case t: TypeTree =>
         addTypeDependency(t.tpe)
       case ref: RefTree =>
@@ -379,6 +376,10 @@ private class ExtractDependenciesCollector extends tpd.TreeTraverser { thisTreeT
       case _ =>
         traverseChildren(tree)
     }
+  } catch {
+    case ex: AssertionError =>
+      println(i"asserted failed while traversing $tree")
+      throw ex
   }
 
   /** Traverse a used type and record all the dependencies we need to keep track

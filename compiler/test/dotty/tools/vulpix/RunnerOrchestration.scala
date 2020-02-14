@@ -3,6 +3,7 @@ package tools
 package vulpix
 
 import java.io.{ File => JFile, InputStreamReader, BufferedReader, PrintStream }
+import java.nio.file.Paths
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.TimeoutException
 
@@ -47,7 +48,7 @@ trait RunnerOrchestration {
   def runMain(classPath: String)(implicit summaryReport: SummaryReporting): Status =
     monitor.runMain(classPath)
 
-  private[this] val monitor = new RunnerMonitor
+  private val monitor = new RunnerMonitor
 
   /** The runner monitor object keeps track of child JVM processes by keeping
    *  them in two structures - one for free, and one for busy children.
@@ -62,9 +63,9 @@ trait RunnerOrchestration {
     def runMain(classPath: String)(implicit summaryReport: SummaryReporting): Status =
       withRunner(_.runMain(classPath))
 
-    private class Runner(private[this] var process: Process) {
-      private[this] var childStdout: BufferedReader = _
-      private[this] var childStdin: PrintStream = _
+    private class Runner(private var process: Process) {
+      private var childStdout: BufferedReader = _
+      private var childStdin: PrintStream = _
 
       /** Checks if `process` is still alive
        *
@@ -85,7 +86,7 @@ trait RunnerOrchestration {
       }
 
       /** Did add hook to kill the child VMs? */
-      private[this] val didAddCleanupCallback = new AtomicBoolean(false)
+      private val didAddCleanupCallback = new AtomicBoolean(false)
 
       /** Blocks less than `maxDuration` while running `Test.main` from `dir` */
       def runMain(classPath: String)(implicit summaryReport: SummaryReporting): Status = {
@@ -116,7 +117,7 @@ trait RunnerOrchestration {
           val sb = new StringBuilder
 
           if (childStdout eq null)
-            childStdout = new BufferedReader(new InputStreamReader(process.getInputStream))
+            childStdout = new BufferedReader(new InputStreamReader(process.getInputStream, "UTF-8"))
 
           var childOutput: String = childStdout.readLine()
 
@@ -126,8 +127,7 @@ trait RunnerOrchestration {
           childOutput = childStdout.readLine()
 
           while (childOutput != ChildJVMMain.MessageEnd && childOutput != null) {
-            sb.append(childOutput)
-            sb += '\n'
+            sb.append(childOutput).append(System.lineSeparator)
             childOutput = childStdout.readLine()
           }
 
@@ -156,21 +156,19 @@ trait RunnerOrchestration {
      *  scala library.
      */
     private def createProcess: Process = {
-      val sep = JFile.separator
-      val cp =
-        classOf[ChildJVMMain].getProtectionDomain.getCodeSource.getLocation.getFile + JFile.pathSeparator +
-        Properties.scalaLibrary
-      val javaBin = sys.props("java.home") + sep + "bin" + sep + "java"
-      new ProcessBuilder(javaBin, "-Xmx1g", "-cp", cp, "dotty.tools.vulpix.ChildJVMMain")
+      val url = classOf[ChildJVMMain].getProtectionDomain.getCodeSource.getLocation
+      val cp = Paths.get(url.toURI).toString + JFile.pathSeparator + Properties.scalaLibrary
+      val javaBin = Paths.get(sys.props("java.home"), "bin", "java").toString
+      new ProcessBuilder(javaBin, "-Dfile.encoding=UTF-8", "-Xmx1g", "-cp", cp, "dotty.tools.vulpix.ChildJVMMain")
         .redirectErrorStream(true)
         .redirectInput(ProcessBuilder.Redirect.PIPE)
         .redirectOutput(ProcessBuilder.Redirect.PIPE)
         .start()
     }
 
-    private[this] val allRunners = List.fill(numberOfSlaves)(new Runner(createProcess))
-    private[this] val freeRunners = mutable.Queue(allRunners: _*)
-    private[this] val busyRunners = mutable.Set.empty[Runner]
+    private val allRunners = List.fill(numberOfSlaves)(new Runner(createProcess))
+    private val freeRunners = mutable.Queue(allRunners: _*)
+    private val busyRunners = mutable.Set.empty[Runner]
 
     private def getRunner(): Runner = synchronized {
       while (freeRunners.isEmpty) wait()

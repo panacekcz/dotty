@@ -30,8 +30,7 @@ import util.Store
 class LiftTry extends MiniPhase with IdentityDenotTransformer { thisPhase =>
   import ast.tpd._
 
-  /** the following two members override abstract members in Transform */
-  val phaseName: String = "liftTry"
+  val phaseName: String = LiftTry.name
 
   private var NeedLift: Store.Location[Boolean] = _
   private def needLift(implicit ctx: Context): Boolean = ctx.store(NeedLift)
@@ -46,9 +45,15 @@ class LiftTry extends MiniPhase with IdentityDenotTransformer { thisPhase =>
     liftingCtx(true)
 
   override def prepareForValDef(tree: ValDef)(implicit ctx: Context): Context =
-    if (!tree.symbol.exists  ||
-        tree.symbol.isSelfSym ||
-        tree.symbol.owner == ctx.owner.enclosingMethod) ctx
+    if !tree.symbol.exists
+       || tree.symbol.isSelfSym
+       || tree.symbol.owner == ctx.owner.enclosingMethod
+          && !tree.symbol.is(Lazy)
+            // The current implementation wraps initializers of lazy vals in
+            // calls to an initialize method, which means that a `try` in the
+            // initializer needs to be lifted. Note that the new scheme proposed
+            // in #6979 would avoid this.
+    then ctx
     else liftingCtx(true)
 
   override def prepareForAssign(tree: Assign)(implicit ctx: Context): Context =
@@ -64,12 +69,14 @@ class LiftTry extends MiniPhase with IdentityDenotTransformer { thisPhase =>
 
   override def transformTry(tree: Try)(implicit ctx: Context): Tree =
     if (needLift && tree.cases.nonEmpty) {
-      ctx.debuglog(i"lifting tree at ${tree.pos}, current owner = ${ctx.owner}")
+      ctx.debuglog(i"lifting tree at ${tree.span}, current owner = ${ctx.owner}")
       val fn = ctx.newSymbol(
         ctx.owner, LiftedTreeName.fresh(), Synthetic | Method,
-        MethodType(Nil, tree.tpe.widenIfUnstable), coord = tree.pos)
+        MethodType(Nil, tree.tpe.widenIfUnstable), coord = tree.span)
       tree.changeOwnerAfter(ctx.owner, fn, thisPhase)
       Block(DefDef(fn, tree) :: Nil, ref(fn).appliedToNone)
     }
     else tree
 }
+object LiftTry:
+  val name = "liftTry"

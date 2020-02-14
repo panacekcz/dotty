@@ -6,12 +6,13 @@ import * as compareVersions from 'compare-versions'
 
 import { ChildProcess } from "child_process"
 
-import { ExtensionContext } from 'vscode'
+import { ExtensionContext,  Disposable } from 'vscode'
 import * as vscode from 'vscode'
 import { LanguageClient, LanguageClientOptions, RevealOutputChannelOn,
          ServerOptions } from 'vscode-languageclient'
 import { enableOldServerWorkaround } from './compat'
 import * as features from './features'
+import { DecompiledDocumentProvider } from './tasty-decompiler'
 
 export let client: LanguageClient
 
@@ -49,6 +50,21 @@ function isConfiguredProject() {
 }
 
 export function activate(context: ExtensionContext) {
+  // Override the language configuration from vscode-scala (doing this from
+  // package.json does not work)
+  vscode.languages.setLanguageConfiguration("scala", {
+    "indentationRules": {
+      // Auto-indent when pressing enter on a line matching this regexp, in details:
+      // 1. If they're not preceded by `end`, auto-indent after `while`, `for`, `match`, `try`, `if`
+      // 2. Auto-indent after `if ...` as long as it doesn't match `if ... then ...`
+      // 3. Auto-indent after `then`, `else`, `do`, `catch`, `finally`, `yield`, `case`, `=`, `=>`, `<-`, `=>>`x
+      "increaseIndentPattern":
+        /(((?<!\bend\b\s*?)\b(if|while|for|match|try))|(\bif\s+(?!.*?\bthen\b.*?$)[^\s]*?)|(\b(then|else|do|catch|finally|yield|case))|=|=>|<-|=>>)\s*?$/,
+      // Only auto-unindent completed `end` folowed by `while`, `for`, `match`, `try`, `if`
+      "decreaseIndentPattern": /(^\s*end\b\s*)\b(if|while|for|match|try)$/
+    }
+  })
+
   extensionContext = context
   outputChannel = vscode.window.createOutputChannel("Dotty")
   tracer = new Tracer({
@@ -333,8 +349,18 @@ function run(serverOptions: ServerOptions, isOldServer: boolean) {
     revealOutputChannelOn: RevealOutputChannelOn.Never
   }
 
+  // register DecompiledDocumentProvider for Tasty decompiler results
+  const provider = new DecompiledDocumentProvider()
+
+  const providerRegistration = Disposable.from(
+    vscode.workspace.registerTextDocumentContentProvider(DecompiledDocumentProvider.scheme, provider)
+  )
+
+  extensionContext.subscriptions.push(providerRegistration, provider)
+
   client = new LanguageClient(extensionName, "Dotty", serverOptions, clientOptions)
   client.registerFeature(new features.WorksheetRunFeature(client))
+  client.registerFeature(new features.TastyDecompilerFeature(client, provider))
 
   if (isOldServer)
     enableOldServerWorkaround(client)

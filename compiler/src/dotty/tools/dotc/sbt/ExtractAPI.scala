@@ -41,6 +41,14 @@ import scala.collection.mutable
 class ExtractAPI extends Phase {
   override def phaseName: String = "sbt-api"
 
+  override def isRunnable(implicit ctx: Context): Boolean = {
+    def forceRun = ctx.settings.YdumpSbtInc.value || ctx.settings.YforceSbtPhases.value
+    super.isRunnable && (ctx.sbtCallback != null || forceRun)
+  }
+
+  // Check no needed. Does not transform trees
+  override def isCheckable: Boolean = false
+
   // SuperAccessors need to be part of the API (see the scripted test
   // `trait-super` for an example where this matters), this is only the case
   // after `PostTyper` (unlike `ExtractDependencies`, the simplication to trees
@@ -50,30 +58,26 @@ class ExtractAPI extends Phase {
 
   override def run(implicit ctx: Context): Unit = {
     val unit = ctx.compilationUnit
-    val dumpInc = ctx.settings.YdumpSbtInc.value
-    val forceRun = dumpInc || ctx.settings.YforceSbtPhases.value
-    if ((ctx.sbtCallback != null || forceRun) && !unit.isJava) {
-      val sourceFile = unit.source.file
-      if (ctx.sbtCallback != null)
-        ctx.sbtCallback.startSource(sourceFile.file)
+    val sourceFile = unit.source.file
+    if (ctx.sbtCallback != null)
+      ctx.sbtCallback.startSource(sourceFile.file)
 
-      val apiTraverser = new ExtractAPICollector
-      val classes = apiTraverser.apiSource(unit.tpdTree)
-      val mainClasses = apiTraverser.mainClasses
+    val apiTraverser = new ExtractAPICollector
+    val classes = apiTraverser.apiSource(unit.tpdTree)
+    val mainClasses = apiTraverser.mainClasses
 
-      if (dumpInc) {
-        // Append to existing file that should have been created by ExtractDependencies
-        val pw = new PrintWriter(File(sourceFile.jpath).changeExtension("inc").toFile
-          .bufferedWriter(append = true), true)
-        try {
-          classes.foreach(source => pw.println(DefaultShowAPI(source)))
-        } finally pw.close()
-      }
+    if (ctx.settings.YdumpSbtInc.value) {
+      // Append to existing file that should have been created by ExtractDependencies
+      val pw = new PrintWriter(File(sourceFile.jpath).changeExtension("inc").toFile
+        .bufferedWriter(append = true), true)
+      try {
+        classes.foreach(source => pw.println(DefaultShowAPI(source)))
+      } finally pw.close()
+    }
 
-      if (ctx.sbtCallback != null) {
-        classes.foreach(ctx.sbtCallback.api(sourceFile.file, _))
-        mainClasses.foreach(ctx.sbtCallback.mainClass(sourceFile.file, _))
-      }
+    if (ctx.sbtCallback != null) {
+      classes.foreach(ctx.sbtCallback.api(sourceFile.file, _))
+      mainClasses.foreach(ctx.sbtCallback.mainClass(sourceFile.file, _))
     }
   }
 }
@@ -127,19 +131,19 @@ private class ExtractAPICollector(implicit val ctx: Context) extends ThunkHolder
   /** This cache is necessary for correctness, see the comment about inherited
    *  members in `apiClassStructure`
    */
-  private[this] val classLikeCache = new mutable.HashMap[ClassSymbol, api.ClassLikeDef]
+  private val classLikeCache = new mutable.HashMap[ClassSymbol, api.ClassLikeDef]
   /** This cache is optional, it avoids recomputing representations */
-  private[this] val typeCache = new mutable.HashMap[Type, api.Type]
+  private val typeCache = new mutable.HashMap[Type, api.Type]
   /** This cache is necessary to avoid unstable name hashing when `typeCache` is present,
    *  see the comment in the `RefinedType` case in `computeType`
    *  The cache key is (api of RefinedType#parent, api of RefinedType#refinedInfo).
     */
-  private[this] val refinedTypeCache = new mutable.HashMap[(api.Type, api.Definition), api.Structure]
+  private val refinedTypeCache = new mutable.HashMap[(api.Type, api.Definition), api.Structure]
 
-  private[this] val allNonLocalClassesInSrc = new mutable.HashSet[xsbti.api.ClassLike]
-  private[this] val _mainClasses = new mutable.HashSet[String]
+  private val allNonLocalClassesInSrc = new mutable.HashSet[xsbti.api.ClassLike]
+  private val _mainClasses = new mutable.HashSet[String]
 
-  private[this] object Constants {
+  private object Constants {
     val emptyStringArray = Array[String]()
     val local            = api.ThisQualifier.create()
     val public           = api.Public.create()
@@ -226,14 +230,13 @@ private class ExtractAPICollector(implicit val ctx: Context) extends ThunkHolder
 
     allNonLocalClassesInSrc += cl
 
-    if (sym.isStatic && defType == DefinitionType.Module && ctx.platform.hasMainMethod(sym)) {
+    if (sym.isStatic && !sym.is(Trait) && ctx.platform.hasMainMethod(sym)) {
+       // If sym is an object, all main methods count, otherwise only @static ones count.
       _mainClasses += name
     }
 
     api.ClassLikeDef.of(name, acc, modifiers, anns, tparams, defType)
   }
-
-  private[this] val LegacyAppClass = ctx.requiredClass("dotty.runtime.LegacyApp")
 
   def apiClassStructure(csym: ClassSymbol): api.Structure = {
     val cinfo = csym.classInfo
@@ -245,7 +248,7 @@ private class ExtractAPICollector(implicit val ctx: Context) extends ThunkHolder
           case ex: TypeError =>
             // See neg/i1750a for an example where a cyclic error can arise.
             // The root cause in this example is an illegal "override" of an inner trait
-            ctx.error(ex.toMessage, csym.pos)
+            ctx.error(ex, csym.sourcePos)
             defn.ObjectType :: Nil
         }
       if (ValueClasses.isDerivedValueClass(csym)) {
@@ -270,9 +273,7 @@ private class ExtractAPICollector(implicit val ctx: Context) extends ThunkHolder
     // TODO: We shouldn't have to compute inherited members. Instead, `Structure`
     // should have a lazy `parentStructures` field.
     val inherited = cinfo.baseClasses
-      // We cannot filter out `LegacyApp` because it contains the main method,
-      // see the comment about main class discovery in `computeType`.
-      .filter(bc => !bc.is(Scala2x) || bc.eq(LegacyAppClass))
+      .filter(bc => !bc.is(Scala2x))
       .flatMap(_.classInfo.decls.filter(s => !(s.is(Private) || declSet.contains(s))))
     // Inherited members need to be computed lazily because a class might contain
     // itself as an inherited member, like in `class A { class B extends A }`,
@@ -327,7 +328,7 @@ private class ExtractAPICollector(implicit val ctx: Context) extends ThunkHolder
     } else if (sym.is(Mutable, butNot = Accessor)) {
       api.Var.of(sym.name.toString, apiAccess(sym), apiModifiers(sym),
         apiAnnotations(sym).toArray, apiType(sym.info))
-    } else if (sym.isStable && !sym.isRealMethod) {
+    } else if (sym.isStableMember && !sym.isRealMethod) {
       api.Val.of(sym.name.toString, apiAccess(sym), apiModifiers(sym),
         apiAnnotations(sym).toArray, apiType(sym.info))
     } else {
@@ -354,7 +355,7 @@ private class ExtractAPICollector(implicit val ctx: Context) extends ThunkHolder
               qual.info.member(DefaultGetterName(sym.name, start + i)).exists)
           } else
             pnames.indices.map(Function.const(false))
-        val params = (pnames, ptypes, defaults).zipped.map((pname, ptype, isDefault) =>
+        val params = pnames.lazyZip(ptypes).lazyZip(defaults).map((pname, ptype, isDefault) =>
           api.MethodParameter.of(pname.toString, apiType(ptype),
             isDefault, api.ParameterModifier.Plain))
         api.ParameterList.of(params.toArray, mt.isImplicitMethod) :: paramLists(restpe, params.length)
@@ -364,7 +365,7 @@ private class ExtractAPICollector(implicit val ctx: Context) extends ThunkHolder
 
     val tparams = sym.info match {
       case pt: TypeLambda =>
-        (pt.paramNames, pt.paramInfos).zipped.map((pname, pbounds) =>
+        pt.paramNames.lazyZip(pt.paramInfos).map((pname, pbounds) =>
           apiTypeParameter(pname.toString, 0, pbounds.lo, pbounds.hi))
       case _ =>
         Nil
@@ -544,7 +545,7 @@ private class ExtractAPICollector(implicit val ctx: Context) extends ThunkHolder
   }
 
   def apiTypeParameter(tparam: ParamInfo): api.TypeParameter =
-    apiTypeParameter(tparam.paramName.toString, tparam.paramVariance,
+    apiTypeParameter(tparam.paramName.toString, tparam.paramVarianceSign,
       tparam.paramInfo.bounds.lo, tparam.paramInfo.bounds.hi)
 
   def apiTypeParameter(name: String, variance: Int, lo: Type, hi: Type): api.TypeParameter =
@@ -561,11 +562,11 @@ private class ExtractAPICollector(implicit val ctx: Context) extends ThunkHolder
   def apiAccess(sym: Symbol): api.Access = {
     // Symbols which are private[foo] do not have the flag Private set,
     // but their `privateWithin` exists, see `Parsers#ParserCommon#normalize`.
-    if (!sym.is(Protected | Private) && !sym.privateWithin.exists)
+    if (!sym.isOneOf(Protected | Private) && !sym.privateWithin.exists)
       Constants.public
-    else if (sym.is(PrivateLocal))
+    else if (sym.isAllOf(PrivateLocal))
       Constants.privateLocal
-    else if (sym.is(ProtectedLocal))
+    else if (sym.isAllOf(ProtectedLocal))
       Constants.protectedLocal
     else {
       val qualifier =
@@ -582,16 +583,16 @@ private class ExtractAPICollector(implicit val ctx: Context) extends ThunkHolder
 
   def apiModifiers(sym: Symbol): api.Modifiers = {
     val absOver = sym.is(AbsOverride)
-    val abs = sym.is(Abstract) || sym.is(Deferred) || absOver
-    val over = sym.is(Override) || absOver
+    val abs = absOver || sym.isOneOf(Trait | Abstract | Deferred)
+    val over = absOver || sym.is(Override)
     new api.Modifiers(abs, over, sym.is(Final), sym.is(Sealed),
-      sym.is(Implicit), sym.is(Lazy), sym.is(Macro), sym.isSuperAccessor)
+      sym.isOneOf(GivenOrImplicit), sym.is(Lazy), sym.is(Macro), sym.isSuperAccessor)
   }
 
   def apiAnnotations(s: Symbol): List[api.Annotation] = {
     val annots = new mutable.ListBuffer[api.Annotation]
-
-    if (Inliner.hasBodyToInline(s)) {
+    val inlineBody = Inliner.bodyToInline(s)
+    if (!inlineBody.isEmpty) {
       // FIXME: If the body of an inlineable method changes, all the reverse
       // dependencies of this method need to be recompiled. sbt has no way
       // of tracking method bodies, so as a hack we include the pretty-printed
@@ -599,7 +600,7 @@ private class ExtractAPICollector(implicit val ctx: Context) extends ThunkHolder
       // To do this properly we would need a way to hash trees and types in
       // dotty itself.
       val printTypesCtx = ctx.fresh.setSetting(ctx.settings.XprintTypes, true)
-      annots += marker(Inliner.bodyToInline(s).show(printTypesCtx))
+      annots += marker(inlineBody.show(printTypesCtx))
     }
 
     // In the Scala2 ExtractAPI phase we only extract annotations that extend

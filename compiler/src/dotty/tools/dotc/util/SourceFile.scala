@@ -6,10 +6,13 @@ import scala.collection.mutable.ArrayBuffer
 import dotty.tools.io._
 import java.util.regex.Pattern
 import java.io.IOException
-import scala.tasty.util.Chars._
-import Positions._
+import scala.internal.Chars._
+import Spans._
 import scala.io.Codec
+import core.Contexts.Context
 import scala.annotation.internal.sharable
+import java.util.concurrent.atomic.AtomicInteger
+import scala.collection.mutable
 
 import java.util.Optional
 
@@ -27,17 +30,25 @@ object ScriptSourceFile {
         val matcher = headerPattern matcher content.mkString
         if (matcher.find) matcher.end
         else throw new IOException("script file does not close its header with !# or ::!#")
-      } else 0
+      }
+      else 0
     new SourceFile(file, content drop headerLength) {
       override val underlying = new SourceFile(file, content)
     }
   }
 }
 
-case class SourceFile(file: AbstractFile, content: Array[Char]) extends interfaces.SourceFile {
+class SourceFile(val file: AbstractFile, computeContent: => Array[Char]) extends interfaces.SourceFile {
+  import SourceFile._
+
+  private var myContent: Array[Char] = null
+
+  def content(): Array[Char] = {
+    if (myContent == null) myContent = computeContent
+    myContent
+  }
 
   def this(file: AbstractFile, codec: Codec) = this(file, new String(file.toByteArray, codec.charSet).toCharArray)
-  def this(name: String, content: String) = this(new VirtualFile(name), content.toCharArray)
 
   /** Tab increment; can be overridden */
   def tabInc: Int = 8
@@ -46,15 +57,19 @@ case class SourceFile(file: AbstractFile, content: Array[Char]) extends interfac
   override def path: String = file.path
   override def jfile: Optional[JFile] = Optional.ofNullable(file.file)
 
-  override def equals(that : Any): Boolean = that match {
-    case that : SourceFile => file.path == that.file.path && start == that.start
-    case _ => false
-  }
-  override def hashCode: Int = file.path.## + start.##
+  override def equals(that: Any): Boolean =
+    (this `eq` that.asInstanceOf[AnyRef]) || {
+      that match {
+        case that : SourceFile => file == that.file && start == that.start
+        case _ => false
+      }
+    }
 
-  def apply(idx: Int): Char = content.apply(idx)
+  override def hashCode: Int = file.hashCode * 41 + start.hashCode
 
-  val length: Int = content.length
+  def apply(idx: Int): Char = content().apply(idx)
+
+  def length: Int = content().length
 
   /** true for all source files except `NoSource` */
   def exists: Boolean = true
@@ -65,8 +80,8 @@ case class SourceFile(file: AbstractFile, content: Array[Char]) extends interfac
   /** The start of this file in the underlying source file */
   def start: Int = 0
 
-  def atPos(pos: Position): SourcePosition =
-    if (pos.exists) SourcePosition(underlying, pos)
+  def atSpan(span: Span): SourcePosition =
+    if (span.exists) SourcePosition(underlying, span)
     else NoSourcePosition
 
   def isSelfContained: Boolean = underlying eq this
@@ -75,13 +90,13 @@ case class SourceFile(file: AbstractFile, content: Array[Char]) extends interfac
    *  For regular source files, simply return the argument.
    */
   def positionInUltimateSource(position: SourcePosition): SourcePosition =
-    SourcePosition(underlying, position.pos shift start)
+    SourcePosition(underlying, position.span shift start)
 
   private def isLineBreak(idx: Int) =
     if (idx >= length) false else {
-      val ch = content(idx)
+      val ch = content()(idx)
       // don't identify the CR in CR LF as a line break, since LF will do.
-      if (ch == CR) (idx + 1 == length) || (content(idx + 1) != LF)
+      if (ch == CR) (idx + 1 == length) || (content()(idx + 1) != LF)
       else isLineBreakChar(ch)
     }
 
@@ -92,13 +107,20 @@ case class SourceFile(file: AbstractFile, content: Array[Char]) extends interfac
     buf += cs.length // sentinel, so that findLine below works smoother
     buf.toArray
   }
-  private lazy val lineIndices: Array[Int] = calculateLineIndices(content)
+  private lazy val lineIndices: Array[Int] = calculateLineIndices(content())
 
   /** Map line to offset of first character in line */
   def lineToOffset(index: Int): Int = lineIndices(index)
 
+  /** Like `lineToOffset`, but doesn't crash if the index is out of bounds. */
+  def lineToOffsetOpt(index: Int): Option[Int] =
+    if (index < 0 || index >= lineIndices.length)
+      None
+    else
+      Some(lineToOffset(index))
+
   /** A cache to speed up offsetToLine searches to similar lines */
-  private[this] var lastLine = 0
+  private var lastLine = 0
 
   /** Convert offset to line in this source file
    *  Lines are numbered from 0
@@ -128,7 +150,7 @@ case class SourceFile(file: AbstractFile, content: Array[Char]) extends interfac
     var idx = startOfLine(offset)
     var col = 0
     while (idx != offset) {
-      col += (if (idx < length && content(idx) == '\t') (tabInc - col) % tabInc else 1)
+      col += (if (idx < length && content()(idx) == '\t') (tabInc - col) % tabInc else 1)
       idx += 1
     }
     col
@@ -139,17 +161,57 @@ case class SourceFile(file: AbstractFile, content: Array[Char]) extends interfac
     var idx = startOfLine(offset)
     val pad = new StringBuilder
     while (idx != offset) {
-      pad.append(if (idx < length && content(idx) == '\t') '\t' else ' ')
+      pad.append(if (idx < length && content()(idx) == '\t') '\t' else ' ')
       idx += 1
     }
     pad.result()
   }
 
   override def toString: String = file.toString
+
+  // Positioned ids
+
+  private val ctr = new AtomicInteger
+
+  def nextId: Int = {
+    val id = ctr.get
+    if (id % ChunkSize == 0) newChunk
+    else if (ctr.compareAndSet(id, id + 1)) id
+    else nextId
+  }
+
+  private def newChunk: Int = sourceOfChunk.synchronized {
+    val id = chunks << ChunkSizeLog
+    if (chunks == sourceOfChunk.length) {
+      val a = new Array[SourceFile](chunks * 2)
+      System.arraycopy(sourceOfChunk, 0, a, 0, chunks)
+      sourceOfChunk = a
+    }
+    sourceOfChunk(chunks) = this
+    chunks += 1
+    ctr.set(id + 1)
+    id
+  }
+}
+object SourceFile {
+  implicit def eqSource: Eql[SourceFile, SourceFile] = Eql.derived
+
+  implicit def fromContext(implicit ctx: Context): SourceFile = ctx.source
+
+  def fromId(id: Int): SourceFile = sourceOfChunk(id >> ChunkSizeLog)
+
+  def virtual(name: String, content: String) = new SourceFile(new VirtualFile(name, content.getBytes), scala.io.Codec.UTF8)
+
+  private final val ChunkSizeLog = 10
+  private final val ChunkSize = 1 << ChunkSizeLog
+
+  // These two vars are sharable because they're only used in the synchronized block in newChunk
+  @sharable private var chunks: Int = 0
+  @sharable private var sourceOfChunk: Array[SourceFile] = new Array[SourceFile](2000)
 }
 
-@sharable object NoSource extends SourceFile("<no source>", "") {
+@sharable object NoSource extends SourceFile(NoAbstractFile, Array[Char]()) {
   override def exists: Boolean = false
-  override def atPos(pos: Position): SourcePosition = NoSourcePosition
+  override def atSpan(span: Span): SourcePosition = NoSourcePosition
 }
 

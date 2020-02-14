@@ -1,5 +1,5 @@
 object Deriving {
-  import scala.typelevel._
+  import scala.compiletime._
 
   sealed trait Shape
 
@@ -38,7 +38,7 @@ object Deriving {
   }
 
   object Eq {
-    inline def tryEq[T](x: T, y: T) = implicit match {
+    inline def tryEq[T](x: T, y: T) = summonFrom {
       case eq: Eq[T] => eq.equals(x, y)
     }
 

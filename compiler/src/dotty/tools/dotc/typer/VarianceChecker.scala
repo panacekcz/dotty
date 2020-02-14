@@ -7,8 +7,8 @@ import Types._, Contexts._, Flags._, Symbols._, Trees._
 import Decorators._
 import Variances._
 import NameKinds._
-import TypeApplications.varianceConforms
-import util.Positions._
+import util.Spans._
+import util.SourcePosition
 import config.Printers.variances
 import reporting.trace
 
@@ -25,36 +25,51 @@ object VarianceChecker {
    *  Note: this is achieved by a mechanism separate from checking class type parameters.
    *  Question: Can the two mechanisms be combined in one?
    */
-  def checkLambda(tree: tpd.LambdaTypeTree)(implicit ctx: Context): Unit = tree.tpe match {
-    case tl: HKTypeLambda =>
-      val checkOK = new TypeAccumulator[Boolean] {
-        def error(tref: TypeParamRef) = {
-          val VariantName(paramName, v) = tl.paramNames(tref.paramNum).toTermName
-          val paramVarianceStr = if (v == 0) "contra" else "co"
-          val occursStr = variance match {
-            case -1 => "contra"
-            case 0 => "non"
-            case 1 => "co"
+  def checkLambda(tree: tpd.LambdaTypeTree, bounds: TypeBounds)(implicit ctx: Context): Unit =
+    def checkType(tpe: Type): Unit = tpe match
+      case tl: HKTypeLambda if tl.isDeclaredVarianceLambda =>
+        val checkOK = new TypeAccumulator[Boolean] {
+          def paramVarianceSign(tref: TypeParamRef) =
+            tl.typeParams(tref.paramNum).paramVarianceSign
+          def error(tref: TypeParamRef) = {
+            val paramName = tl.paramNames(tref.paramNum).toTermName
+            val v = paramVarianceSign(tref)
+            val paramVarianceStr = if (v < 0) "contra" else "co"
+            val occursStr = variance match {
+              case -1 => "contra"
+              case 0 => "in"
+              case 1 => "co"
+            }
+            val pos = tree.tparams
+              .find(_.name.toTermName == paramName)
+              .map(_.sourcePos)
+              .getOrElse(tree.sourcePos)
+            ctx.error(em"${paramVarianceStr}variant type parameter $paramName occurs in ${occursStr}variant position in ${tl.resType}", pos)
           }
-          val pos = tree.tparams
-            .find(_.name.toTermName == paramName)
-            .map(_.pos)
-            .getOrElse(tree.pos)
-          ctx.error(em"${paramVarianceStr}variant type parameter $paramName occurs in ${occursStr}variant position in ${tl.resType}", pos)
-        }
-        def apply(x: Boolean, t: Type) = x && {
-          t match {
-            case tref: TypeParamRef if tref.binder `eq` tl =>
-              val v = tl.typeParams(tref.paramNum).paramVariance
-              varianceConforms(variance, v) || { error(tref); false }
-            case _ =>
-              foldOver(x, t)
+          def apply(x: Boolean, t: Type) = x && {
+            t match {
+              case tref: TypeParamRef if tref.binder `eq` tl =>
+                varianceConforms(variance, paramVarianceSign(tref))
+                || { error(tref); false }
+              case AnnotatedType(_, annot) if annot.symbol == defn.UncheckedVarianceAnnot =>
+                x
+              case _ =>
+                foldOver(x, t)
+            }
           }
         }
-      }
-      checkOK.apply(true, tl.resType)
-    case _ =>
-  }
+        checkOK(true, tl.resType)
+      case _ =>
+    end checkType
+
+    checkType(bounds.lo)
+    checkType(bounds.hi)
+  end checkLambda
+
+  private def varianceLabel(v: Variance): String =
+    if (v is Covariant) "covariant"
+    else if (v is Contravariant) "contravariant"
+    else "invariant"
 }
 
 class VarianceChecker()(implicit ctx: Context) {
@@ -62,27 +77,23 @@ class VarianceChecker()(implicit ctx: Context) {
   import tpd._
 
   private object Validator extends TypeAccumulator[Option[VarianceError]] {
-    private[this] var base: Symbol = _
-
-    /** Is no variance checking needed within definition of `base`? */
-    def ignoreVarianceIn(base: Symbol): Boolean = (
-         base.isTerm
-      || base.is(Package)
-      || base.is(PrivateLocal)
-    )
+    private var base: Symbol = _
 
     /** The variance of a symbol occurrence of `tvar` seen at the level of the definition of `base`.
      *  The search proceeds from `base` to the owner of `tvar`.
      *  Initially the state is covariant, but it might change along the search.
      */
-    def relativeVariance(tvar: Symbol, base: Symbol, v: Variance = Covariant): Variance = /*trace(i"relative variance of $tvar wrt $base, so far: $v")*/ {
-      if (base == tvar.owner) v
-      else if ((base is Param) && base.owner.isTerm)
+    def relativeVariance(tvar: Symbol, base: Symbol, v: Variance = Covariant): Variance = /*trace(i"relative variance of $tvar wrt $base, so far: $v")*/
+      if base == tvar.owner then
+        v
+      else if base.is(Param) && base.owner.isTerm && !base.owner.isAllOf(PrivateLocal) then
         relativeVariance(tvar, paramOuter(base.owner), flip(v))
-      else if (ignoreVarianceIn(base.owner)) Bivariant
-      else if (base.isAliasType) relativeVariance(tvar, base.owner, Invariant)
-      else relativeVariance(tvar, base.owner, v)
-    }
+      else if base.owner.isTerm || base.owner.is(Package) || base.isAllOf(PrivateLocal) then
+        Bivariant
+      else if base.isAliasType then
+        relativeVariance(tvar, base.owner, Invariant)
+      else
+        relativeVariance(tvar, base.owner, v)
 
     /** The next level to take into account when determining the
      *  relative variance with a method parameter as base. The method
@@ -102,13 +113,13 @@ class VarianceChecker()(implicit ctx: Context) {
       if (relative == Bivariant) None
       else {
         val required = compose(relative, this.variance)
-        def tvar_s = s"$tvar (${varianceString(tvar.flags)} ${tvar.showLocated})"
+        def tvar_s = s"$tvar (${varianceLabel(tvar.flags)} ${tvar.showLocated})"
         def base_s = s"$base in ${base.owner}" + (if (base.owner.isClass) "" else " in " + base.owner.enclosingClass)
-        ctx.log(s"verifying $tvar_s is ${varianceString(required)} at $base_s")
-        ctx.log(s"relative variance: ${varianceString(relative)}")
+        ctx.log(s"verifying $tvar_s is ${varianceLabel(required)} at $base_s")
+        ctx.log(s"relative variance: ${varianceLabel(relative)}")
         ctx.log(s"current variance: ${this.variance}")
         ctx.log(s"owner chain: ${base.ownersIterator.toList}")
-        if (tvar is required) None
+        if (tvar.isOneOf(required)) None
         else Some(VarianceError(tvar, required))
       }
     }
@@ -120,18 +131,19 @@ class VarianceChecker()(implicit ctx: Context) {
     def apply(status: Option[VarianceError], tp: Type): Option[VarianceError] = trace(s"variance checking $tp of $base at $variance", variances) {
       try
         if (status.isDefined) status
-        else tp match {
+        else tp.normalized match {
           case tp: TypeRef =>
             val sym = tp.symbol
-            if (sym.variance != 0 && base.isContainedIn(sym.owner)) checkVarianceOfSymbol(sym)
-            else if (sym.isAliasType) this(status, sym.info.bounds.hi)
-            else foldOver(status, tp)
+            if (sym.isOneOf(VarianceFlags) && base.isContainedIn(sym.owner)) checkVarianceOfSymbol(sym)
+            else sym.info match {
+              case MatchAlias(_) => foldOver(status, tp)
+              case TypeAlias(alias) => this(status, alias)
+              case _ => foldOver(status, tp)
+            }
           case tp: MethodOrPoly =>
             this(status, tp.resultType) // params will be checked in their TypeDef or ValDef nodes.
           case AnnotatedType(_, annot) if annot.symbol == defn.UncheckedVarianceAnnot =>
             status
-          case tp: MatchType =>
-            apply(status, tp.bound)
           case tp: ClassInfo =>
             foldOver(status, tp.classParents)
           case _ =>
@@ -151,17 +163,18 @@ class VarianceChecker()(implicit ctx: Context) {
   }
 
   private object Traverser extends TreeTraverser {
-    def checkVariance(sym: Symbol, pos: Position) = Validator.validateDefinition(sym) match {
+    def checkVariance(sym: Symbol, pos: SourcePosition) = Validator.validateDefinition(sym) match {
       case Some(VarianceError(tvar, required)) =>
-        def msg = i"${varianceString(tvar.flags)} $tvar occurs in ${varianceString(required)} position in type ${sym.info} of $sym"
-        if (ctx.scala2Mode &&
-            (sym.owner.isConstructor || sym.ownersIterator.exists(_.is(ProtectedLocal)))) {
-          ctx.migrationWarning(s"According to new variance rules, this is no longer accepted; need to annotate with @uncheckedVariance:\n$msg", pos)
-            // patch(Position(pos.end), " @scala.annotation.unchecked.uncheckedVariance")
+        def msg = i"${varianceLabel(tvar.flags)} $tvar occurs in ${varianceLabel(required)} position in type ${sym.info} of $sym"
+        if (ctx.scala2CompatMode &&
+            (sym.owner.isConstructor || sym.ownersIterator.exists(_.isAllOf(ProtectedLocal))))
+          ctx.migrationWarning(
+            s"According to new variance rules, this is no longer accepted; need to annotate with @uncheckedVariance:\n$msg",
+            pos)
+            // patch(Span(pos.end), " @scala.annotation.unchecked.uncheckedVariance")
             // Patch is disabled until two TODOs are solved:
             // TODO use an import or shorten if possible
             // TODO need to use a `:' if annotation is on term
-        }
         else ctx.error(msg, pos)
       case None =>
     }
@@ -169,27 +182,29 @@ class VarianceChecker()(implicit ctx: Context) {
     override def traverse(tree: Tree)(implicit ctx: Context) = {
       def sym = tree.symbol
       // No variance check for private/protected[this] methods/values.
-      def skip =
-        !sym.exists ||
-        sym.is(PrivateLocal) ||
-        sym.name.is(InlineAccessorName) || // TODO: should we exclude all synthetic members?
-        sym.is(TypeParam) && sym.owner.isClass // already taken care of in primary constructor of class
-      tree match {
+      def skip = !sym.exists
+        || sym.name.is(InlineAccessorName) // TODO: should we exclude all synthetic members?
+        || sym.isAllOf(LocalParamAccessor) // local class parameters are construction only
+        || sym.is(TypeParam) && sym.owner.isClass // already taken care of in primary constructor of class
+      try tree match {
         case defn: MemberDef if skip =>
           ctx.debuglog(s"Skipping variance check of ${sym.showDcl}")
         case tree: TypeDef =>
-          checkVariance(sym, tree.pos)
+          checkVariance(sym, tree.sourcePos)
           tree.rhs match {
             case rhs: Template => traverseChildren(rhs)
             case _ =>
           }
         case tree: ValDef =>
-          checkVariance(sym, tree.pos)
+          checkVariance(sym, tree.sourcePos)
         case DefDef(_, tparams, vparamss, _, _) =>
-          checkVariance(sym, tree.pos)
+          checkVariance(sym, tree.sourcePos)
           tparams foreach traverse
           vparamss foreach (_ foreach traverse)
         case _ =>
+      }
+      catch {
+        case ex: TypeError => ctx.error(ex, tree.sourcePos.focus)
       }
     }
   }

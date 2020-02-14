@@ -11,9 +11,10 @@ import Symbols._
 import Names._
 import StdNames._
 import NameKinds.UniqueName
-import util.Positions._
+import util.Spans._
 import collection.mutable
 import Trees._
+import Decorators._
 
 /** A class that handles argument lifting. Argument lifting is needed in the following
  *  scenarios:
@@ -46,9 +47,12 @@ abstract class Lifter {
       // don't instantiate here, as the type params could be further constrained, see tests/pos/pickleinf.scala
       var liftedType = expr.tpe.widen
       if (liftedFlags.is(Method)) liftedType = ExprType(liftedType)
-      val lifted = ctx.newSymbol(ctx.owner, name, liftedFlags | Synthetic, liftedType, coord = positionCoord(expr.pos))
-      defs += liftedDef(lifted, expr).withPos(expr.pos)
-      ref(lifted.termRef).withPos(expr.pos.focus)
+      val lifted = ctx.newSymbol(ctx.owner, name, liftedFlags | Synthetic, liftedType, coord = spanCoord(expr.span))
+      defs += liftedDef(lifted, expr)
+        .withSpan(expr.span)
+        .changeNonLocalOwners(lifted)
+        .setDefTree
+      ref(lifted.termRef).withSpan(expr.span.focus)
     }
 
   /** Lift out common part of lhs tree taking part in an operator assignment such as
@@ -80,12 +84,12 @@ abstract class Lifter {
   def liftArgs(defs: mutable.ListBuffer[Tree], methRef: Type, args: List[Tree])(implicit ctx: Context): List[Tree] =
     methRef.widen match {
       case mt: MethodType =>
-        (args, mt.paramNames, mt.paramInfos).zipped.map { (arg, name, tp) =>
+        args.lazyZip(mt.paramNames).lazyZip(mt.paramInfos).map { (arg, name, tp) =>
           val lifter = if (tp.isInstanceOf[ExprType]) exprLifter else this
           lifter.liftArg(defs, arg, if (name.firstPart contains '$') EmptyTermName else name)
         }
       case _ =>
-        args.map(liftArg(defs, _))
+        args.mapConserve(liftArg(defs, _))
     }
 
   /** Lift out function prefix and all arguments from application
@@ -121,12 +125,10 @@ abstract class Lifter {
    *     val x0 = pre
    *     x0.f(...)
    *
-   *  unless `pre` is a `New` or `pre` is idempotent.
+   *  unless `pre` is idempotent.
    */
-  def liftPrefix(defs: mutable.ListBuffer[Tree], tree: Tree)(implicit ctx: Context): Tree = tree match {
-    case New(_) => tree
-    case _ => if (isIdempotentExpr(tree)) tree else lift(defs, tree)
-  }
+  def liftPrefix(defs: mutable.ListBuffer[Tree], tree: Tree)(implicit ctx: Context): Tree =
+    if (isIdempotentExpr(tree)) tree else lift(defs, tree)
 }
 
 /** No lifting at all */
@@ -142,7 +144,7 @@ object LiftImpure extends LiftImpure
 
 /** Lift all impure or complex arguments */
 class LiftComplex extends Lifter {
-  def noLift(expr: tpd.Tree)(implicit ctx: Context): Boolean = tpd.isSimplyPure(expr)
+  def noLift(expr: tpd.Tree)(implicit ctx: Context): Boolean = tpd.isPurePath(expr)
   override def exprLifter: Lifter = LiftToDefs
 }
 object LiftComplex extends LiftComplex
@@ -178,6 +180,10 @@ object EtaExpansion extends LiftImpure {
    *         { val xs = es; (x1: T1, ..., xn: Tn) => expr(x1, ..., xn) _ }
    *
    *  where `T1, ..., Tn` are the paremeter types of the expanded method.
+   *  If `expr` has implicit function type, the arguments are passed with `given`.
+   *  E.g. for (1):
+   *
+   *      { val xs = es; (x1, ..., xn) => expr(using x1, ..., xn) }
    *
    *  Case (3) applies if the method is curried, i.e. its result type is again a method
    *  type. Case (2) applies if the expected arity of the function type `xarity` differs
@@ -192,6 +198,19 @@ object EtaExpansion extends LiftImpure {
    *  In each case, the result is an untyped tree, with `es` and `expr` as typed splices.
    *
    *    F[V](x) ==> (x => F[X])
+   *
+   *  Note: We allow eta expanding a method with a call by name parameter like
+   *
+   *    def m(x: => T): T
+   *
+   *  to a value of type (=> T) => T. This type cannot be written in source, since
+   *  by-name types => T are not legal argument types.
+   *
+   *  It would be simpler to not allow to eta expand by-name methods. That was the rule
+   *  initially, but at some point, the rule was dropped. Enforcing the restriction again
+   *  now would break existing code. Allowing by-name parameters in function types seems to
+   *  be OK. After elimByName they are all converted to regular function types anyway.
+   *  But see comment on the `ExprType` case in function `prune` in class `ConstraintHandling`.
    */
   def etaExpand(tree: Tree, mt: MethodType, xarity: Int)(implicit ctx: Context): untpd.Tree = {
     import untpd._
@@ -206,16 +225,19 @@ object EtaExpansion extends LiftImpure {
       if (isLastApplication && mt.paramInfos.length == xarity) mt.paramInfos map (_ => TypeTree())
       else mt.paramInfos map TypeTree
     var paramFlag = Synthetic | Param
-    if (mt.isImplicitMethod) paramFlag |= Implicit
-    val params = (mt.paramNames, paramTypes).zipped.map((name, tpe) =>
-      ValDef(name, tpe, EmptyTree).withFlags(paramFlag).withPos(tree.pos.startPos))
-    var ids: List[Tree] = mt.paramNames map (name => Ident(name).withPos(tree.pos.startPos))
+    if (mt.isContextualMethod) paramFlag |= Given
+    else if (mt.isImplicitMethod) paramFlag |= Implicit
+    val params = mt.paramNames.lazyZip(paramTypes).map((name, tpe) =>
+      ValDef(name, tpe, EmptyTree).withFlags(paramFlag).withSpan(tree.span.startPos))
+    var ids: List[Tree] = mt.paramNames map (name => Ident(name).withSpan(tree.span.startPos))
     if (mt.paramInfos.nonEmpty && mt.paramInfos.last.isRepeatedParam)
       ids = ids.init :+ repeated(ids.last)
-    var body: Tree = Apply(lifted, ids)
-    if (!isLastApplication) body = PostfixOp(body, Ident(nme.WILDCARD))
+    val app = Apply(lifted, ids)
+    if (mt.isContextualMethod) app.setGivenApply()
+    val body = if (isLastApplication) app else PostfixOp(app, Ident(nme.WILDCARD))
     val fn =
-      if (mt.isImplicitMethod) new untpd.FunctionWithMods(params, body, Modifiers(Implicit))
+      if (mt.isContextualMethod) new untpd.FunctionWithMods(params, body, Modifiers(Given))
+      else if (mt.isImplicitMethod) new untpd.FunctionWithMods(params, body, Modifiers(Implicit))
       else untpd.Function(params, body)
     if (defs.nonEmpty) untpd.Block(defs.toList map (untpd.TypedSplice(_)), fn) else fn
   }
