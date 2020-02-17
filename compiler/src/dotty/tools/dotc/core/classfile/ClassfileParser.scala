@@ -55,15 +55,20 @@ object ClassfileParser {
     def withRevPath(revPath: List[(Int, Int)]) = AnnotationPath(tag, index1, index2, revPath)
   }
   object TypeAnnotations {
-    val empty = new TypeAnnotations
+    val empty = new TypeAnnotations(Map.empty)
+    val root = AnnotationPath(0, 0, 0, Nil)
   }
-  class TypeAnnotations {
+  class TypeAnnotationsBuffer{
     val map: scala.collection.mutable.HashMap[AnnotationPath, List[Annotation]] = scala.collection.mutable.HashMap.empty
-    def root = AnnotationPath(0, 0, 0, Nil)
     def annotations(path: AnnotationPath): List[Annotation] = map.getOrElse(path, Nil)
     def add(path: AnnotationPath, annot: Annotation): Unit = map.update(path, annot :: annotations(path))
+    def build: TypeAnnotations = new TypeAnnotations(map.toMap)
+  }
+  class TypeAnnotations(val map: Map[AnnotationPath, List[Annotation]]) {
+    def annotations(path: AnnotationPath): List[Annotation] = map.getOrElse(path, Nil)
     def isEmpty = map.isEmpty
   }
+
 }
 
 class ClassfileParser(
@@ -194,7 +199,7 @@ class ClassfileParser(
     def parseParents(typeAnnots: TypeAnnotations): List[Type] = {
       def parseParent(parentTypeAnnotIndex: Int) = {
         val superClass = pool.getSuperClass(in.nextChar)
-        val (tp, _) = typeRefWithAnnots(superClass, typeAnnots, typeAnnots.root.inTarget(TARGET_PARENT, parentTypeAnnotIndex))
+        val (tp, _) = typeRefWithAnnots(superClass, typeAnnots, TypeAnnotations.root.inTarget(TARGET_PARENT, parentTypeAnnotIndex))
         tp
       }
 
@@ -391,7 +396,7 @@ class ClassfileParser(
     if (tp.isDirectRef(defn.ObjectClass) && !ctx.phase.erasedTypes) defn.AnyType else tp
 
   private def sigToType(sig: SimpleName, typeAnnots: TypeAnnotations, owner: Symbol = null)(implicit ctx: Context): Type = {
-    val annotPath = typeAnnots.root.inTarget(TARGET_FIELD)
+    val annotPath = TypeAnnotations.root.inTarget(TARGET_FIELD)
     var index = 0
     val end = sig.length
     def accept(ch: Char): Unit = {
@@ -677,7 +682,7 @@ class ClassfileParser(
         c convertTo pt
     var newType = symtype
     var newSig: SimpleName = null
-    val typeAnnots: TypeAnnotations = new TypeAnnotations
+    val typeAnnotBuffer: TypeAnnotationsBuffer = new TypeAnnotationsBuffer
 
     def parseAttribute(): Unit = {
       val attrName = pool.getName(in.nextChar).toTypeName
@@ -784,10 +789,10 @@ class ClassfileParser(
 
     /** Parses a single type annotation and adds it to typeAnnots */
     def parseTypeAnnotation(): Unit = {
-      val path = parseTypeAnnotationTargetPath(typeAnnots.root)
+      val path = parseTypeAnnotationTargetPath(TypeAnnotations.root)
       parseAnnotation(in.nextChar) match {
         case Some(annot) =>
-          typeAnnots.add (path, annot)
+          typeAnnotBuffer.add (path, annot)
         case _ =>
       }
     }
@@ -802,6 +807,8 @@ class ClassfileParser(
     // begin parseAttributes
     for (i <- 0 until in.nextChar)
       parseAttribute()
+
+    val typeAnnots = typeAnnotBuffer.build
 
     if (newSig ne null) {
       newType = sigToType(newSig, typeAnnots, sym)
