@@ -28,8 +28,8 @@ class ClassfileAnnotationParsingTest {
       val Seq(annot, example) = clss
       val exampleMod = example.companionModule.moduleClass.asClass
 
-      def member(sym: ClassSymbol, names: Name*) = names.foldLeft[Denotation](sym.denot)((sym, name) => sym.findMember(name, NoPrefix, Flags.EmptyFlags))
-      def memberTerm(name: String) = example.findMember(Names.termName(name), NoPrefix, Flags.EmptyFlags)
+      def member(sym: ClassSymbol, names: Name*) = names.foldLeft[Denotation](sym.denot)((sym, name) => sym.findMember(name, NoPrefix, Flags.EmptyFlags, Flags.EmptyFlags))
+      def memberTerm(name: String) = example.findMember(Names.termName(name), NoPrefix, Flags.EmptyFlags, Flags.EmptyFlags)
       def memberType(name: String) = member(example, Names.typeName(name))
 
 
