@@ -48,6 +48,27 @@ object ClassfileParser {
         mapOver(tp)
     }
   }
+
+  case class AnnotationPath(tag: Int, index1: Int, index2: Int, revPath: List[(Int, Int)]){
+    def inType(kind: Int, param:Int = 0) = AnnotationPath(tag, index1, index2, (kind, param) :: revPath)
+    def inTarget(tag: Int, index1: Int = 0, index2: Int = 0) = AnnotationPath(tag, index1, index2, Nil)
+    def withRevPath(revPath: List[(Int, Int)]) = AnnotationPath(tag, index1, index2, revPath)
+  }
+  object TypeAnnotations {
+    val empty = new TypeAnnotations(Map.empty)
+    val root = AnnotationPath(0, 0, 0, Nil)
+  }
+  class TypeAnnotationsBuffer{
+    val map: scala.collection.mutable.HashMap[AnnotationPath, List[Annotation]] = scala.collection.mutable.HashMap.empty
+    def annotations(path: AnnotationPath): List[Annotation] = map.getOrElse(path, Nil)
+    def add(path: AnnotationPath, annot: Annotation): Unit = map.update(path, annot :: annotations(path))
+    def build: TypeAnnotations = new TypeAnnotations(map.toMap)
+  }
+  class TypeAnnotations(val map: Map[AnnotationPath, List[Annotation]]) {
+    def annotations(path: AnnotationPath): List[Annotation] = map.getOrElse(path, Nil)
+    def isEmpty = map.isEmpty
+  }
+
 }
 
 class ClassfileParser(
@@ -116,6 +137,48 @@ class ClassfileParser(
 
   var sawPrivateConstructor: Boolean = false
 
+  /** Creates a TypeRef to sym, where the prefix is annotated with type annotations from typeAnnots starting at path.
+    * Non-module-class prefixes are widened.
+    * Returns the TypeRef and path to annotations that apply to the sym type.
+    */
+  def typeRefWithAnnotsOnPrefix(sym: Symbol, typeAnnots: TypeAnnotations, path: AnnotationPath)(implicit ctx: Context): (Type, AnnotationPath) = {
+    if (sym.owner.flagsUNSAFE.is(Flags.Module))
+      (sym.typeRef, path)
+    else {
+      val (ownerTypeRef, symAnnotPath) = typeRefWithAnnots(sym.owner, typeAnnots, path)
+      (TypeRef(ownerTypeRef, sym), symAnnotPath)
+    }
+  }
+
+  /** Creates a TypeRef to sym, annotated with type annotations from typeAnnots starting at path.
+    * Non-module-class prefixes are widened.
+    * Returns the TypeRef and path to annotations that apply to members of the type.
+    */
+  def typeRefWithAnnots(symbol: Symbol, typeAnnots: TypeAnnotations, path: AnnotationPath)(implicit ctx: Context): (Type, AnnotationPath) = {
+    def annotateTypeRef(tr: TypeRef, original: Type): (Type, AnnotationPath) = {
+      val sym = tr.symbol
+      if (sym.flagsUNSAFE.is(Flags.Module)){
+        // Prefix of module-owned classes refers to module, so should not be annotated and widened
+        (original, path)// Prefix is not widened
+      }
+      else {
+        // Prefix is a class, so should be annotated and widened
+        val prefix = tr.prefix
+        val (annotatedPrefix, pathFromPrefix) =  prefix.widen match {
+          case widenedPrefix: TypeRef =>
+            annotateTypeRef(widenedPrefix, prefix)
+          case tp => // tp can be AppliedType when inheriting from a inner class of a generic class - in that case, signature is not generated
+            (tp, path)
+        }
+        val refWithAnnotatedPrefix = TypeRef(annotatedPrefix, sym)
+        val annotatedRef = AnnotatedType.make(refWithAnnotatedPrefix, typeAnnots.annotations(pathFromPrefix))
+        (annotatedRef, pathFromPrefix.inType(TYPE_PATH_NESTED))
+      }
+    }
+    val tr = symbol.typeRef
+    annotateTypeRef(tr, tr)
+  }
+
   def parseClass()(implicit ctx: Context): Option[Embedded] = {
     val jflags       = in.nextChar
     val isAnnotation = hasAnnotation(jflags)
@@ -133,7 +196,13 @@ class ClassfileParser(
 
     /** Parse parents for Java classes. For Scala, return AnyRef, since the real type will be unpickled.
      *  Updates the read pointer of 'in'. */
-    def parseParents: List[Type] = {
+    def parseParents(typeAnnots: TypeAnnotations): List[Type] = {
+      def parseParent(parentTypeAnnotIndex: Int) = {
+        val superClass = pool.getSuperClass(in.nextChar)
+        val (tp, _) = typeRefWithAnnots(superClass, typeAnnots, TypeAnnotations.root.inTarget(TARGET_PARENT, parentTypeAnnotIndex))
+        tp
+      }
+
       val superType =
         if (isAnnotation) {
           in.nextChar
@@ -146,10 +215,11 @@ class ClassfileParser(
           in.nextChar
           defn.AnyType
         }
-        else
-          pool.getSuperClass(in.nextChar).typeRef
+        else {
+          parseParent(65535)
+        }
       val ifaceCount = in.nextChar
-      var ifaces = for (i <- (0 until ifaceCount).toList) yield pool.getSuperClass(in.nextChar).typeRef
+      var ifaces = for (i <- (0 until ifaceCount).toList) yield parseParent(i)
         // Dotty deviation: was
         //    var ifaces = for (i <- List.range(0, ifaceCount)) ...
         // This does not typecheck because the type parameter of List is now lower-bounded by Int | Char.
@@ -162,7 +232,18 @@ class ClassfileParser(
 
     val result = unpickleOrParseInnerClasses()
     if (!result.isDefined) {
-      var classInfo: Type = TempClassInfoType(parseParents, instanceScope, classRoot.symbol)
+      val parentsBp = in.bp
+      def parseClassType(typeAnnots: TypeAnnotations): Type =
+        TempClassInfoType(parseParents(typeAnnots), instanceScope, classRoot.symbol)
+      def reparseClassType(typeAnnots: TypeAnnotations): Type = {
+        val oldBp = in.bp
+        in.bp = parentsBp
+        val result = parseClassType(typeAnnots)
+        in.bp = oldBp
+        result
+      }
+
+      var classInfo: Type = parseClassType(TypeAnnotations.empty)
       // might be reassigned by later parseAttributes
       val staticInfo = TempClassInfoType(List(), staticScope, moduleRoot.symbol)
 
@@ -179,7 +260,7 @@ class ClassfileParser(
 
       for (i <- 0 until in.nextChar) parseMember(method = false)
       for (i <- 0 until in.nextChar) parseMember(method = true)
-      classInfo = parseAttributes(classRoot.symbol, classInfo)
+      classInfo = parseAttributes(classRoot.symbol, classInfo, reparseClassType)
       if (isAnnotation)
         // classInfo must be a TempClassInfoType and not a TempPolyType,
         // because Java annotations cannot have type parameters.
@@ -282,10 +363,11 @@ class ClassfileParser(
           addConstructorTypeParams(denot)
         }
 
-        denot.info = pool.getType(in.nextChar)
+        val typeIndex = in.nextChar
+        denot.info = pool.getType(typeIndex, TypeAnnotations.empty)
         if (isEnum) denot.info = ConstantType(Constant(sym))
         if (isConstructor) normalizeConstructorParams()
-        denot.info = translateTempPoly(parseAttributes(sym, denot.info))
+        denot.info = translateTempPoly(parseAttributes(sym, denot.info, typeAnnots => pool.getType(typeIndex, typeAnnots)))
         if (isConstructor) normalizeConstructorInfo()
 
         if (denot.is(Flags.Method) && (jflags & JAVA_ACC_VARARGS) != 0)
@@ -313,7 +395,8 @@ class ClassfileParser(
   final def objToAny(tp: Type)(implicit ctx: Context): Type =
     if (tp.isDirectRef(defn.ObjectClass) && !ctx.phase.erasedTypes) defn.AnyType else tp
 
-  private def sigToType(sig: SimpleName, owner: Symbol = null)(implicit ctx: Context): Type = {
+  private def sigToType(sig: SimpleName, typeAnnots: TypeAnnotations, owner: Symbol = null)(implicit ctx: Context): Type = {
+    val annotPath = TypeAnnotations.root.inTarget(TARGET_FIELD)
     var index = 0
     val end = sig.length
     def accept(ch: Char): Unit = {
@@ -325,11 +408,12 @@ class ClassfileParser(
       while (!isDelimiter(sig(index))) { index += 1 }
       sig.slice(start, index)
     }
+
     // Warning: sigToType contains nested completers which might be forced in a later run!
     // So local methods need their own ctx parameters.
-    def sig2type(tparams: immutable.Map[Name, Symbol], skiptvs: Boolean)(implicit ctx: Context): Type = {
+    def sig2type(tparams: immutable.Map[Name, Symbol], skiptvs: Boolean, annotPath: AnnotationPath)(implicit ctx: Context): Type = {
       val tag = sig(index); index += 1
-      (tag: @switch) match {
+      val tp = (tag: @switch) match {
         case BYTE_TAG   => defn.ByteType
         case CHAR_TAG   => defn.CharType
         case DOUBLE_TAG => defn.DoubleType
@@ -346,51 +430,65 @@ class ClassfileParser(
             case _ =>
               tp
           }
-          def processClassType(tp: Type): Type = tp match {
-            case tp: TypeRef =>
-              if (sig(index) == '<') {
-                accept('<')
-                val argsBuf = if (skiptvs) null else new ListBuffer[Type]
-                while (sig(index) != '>') {
-                  val arg = sig(index) match {
-                    case variance @ ('+' | '-' | '*') =>
-                      index += 1
-                      variance match {
-                        case '+' => objToAny(TypeBounds.upper(sig2type(tparams, skiptvs)))
-                        case '-' =>
-                          val tp = sig2type(tparams, skiptvs)
-                          // sig2type seems to return AnyClass regardless of the situation:
-                          // we don't want Any as a LOWER bound.
-                          if (tp.isDirectRef(defn.AnyClass)) TypeBounds.empty
-                          else TypeBounds.lower(tp)
-                        case '*' => TypeBounds.empty
-                      }
-                    case _ => sig2type(tparams, skiptvs)
-                  }
-                  if (argsBuf != null) argsBuf += arg
-                }
-                accept('>')
-                if (skiptvs) tp else tp.appliedTo(argsBuf.toList)
-              }
-              else tp
-            case tp =>
-              assert(sig(index) != '<', tp)
-              tp
-          }
+          def processClassType(tp: Type, annotPath: AnnotationPath): Type = {
+            val applied = tp match {
+              case tp: TypeRef =>
+                if (sig(index) == '<') {
+                  accept('<')
+                  val argsBuf = if (skiptvs) null else new ListBuffer[Type]
+                  var argIndex = 0
+                  while (sig(index) != '>') {
+                    val argumentPath = annotPath.inType(TYPE_PATH_ARGUMENT, argIndex)
+                    def paramType(path: AnnotationPath) = sig2type(tparams, skiptvs, path)
 
+                    val arg = sig(index) match {
+                      case variance @ ('+' | '-' | '*') =>
+                        // TODO: how to handle annotation on wildcard?
+                        // according to https://checkerframework.org/manual/#generics-instantiation,
+                        // we can apply it to the other bound.
+                        // However, it would not have the same behavior with respect to default (cf distinguishes explicit and implicit bound)
+                        index += 1
+                        variance match {
+                          case '+' => objToAny(TypeBounds.upper(paramType(argumentPath.inType(TYPE_PATH_BOUND, argIndex))))
+                          case '-' =>
+                            val tp = paramType(argumentPath.inType(TYPE_PATH_BOUND, argIndex))
+                            // sig2type seems to return AnyClass regardless of the situation:
+                            // we don't want Any as a LOWER bound.
+                            if (tp.isDirectRef(defn.AnyClass)) TypeBounds.empty
+                            else TypeBounds.lower(tp)
+                          case '*' => TypeBounds.empty
+                        }
+                      case _ => paramType(argumentPath)
+                    }
+                    if (argsBuf != null) argsBuf += arg
+                    argIndex += 1
+                  }
+                  accept('>')
+                  if (skiptvs) tp else tp.appliedTo(argsBuf.toList)
+                }
+                else tp
+              case tp =>
+                // TODO: does this ever happen?
+                assert(sig(index) != '<', tp)
+                tp
+            }
+            AnnotatedType.make(applied, typeAnnots.annotations(annotPath))
+          }
           val classSym = classNameToSymbol(subName(c => c == ';' || c == '<'))
-          var tpe = processClassType(processInner(classSym.typeRef))
+          var (tpe, classAnnotPath) = typeRefWithAnnotsOnPrefix(classSym, typeAnnots, annotPath)
+          tpe = processClassType(processInner(tpe), classAnnotPath)
           while (sig(index) == '.') {
             accept('.')
             val name = subName(c => c == ';' || c == '<' || c == '.').toTypeName
             val clazz = tpe.member(name).symbol
-            tpe = processClassType(processInner(TypeRef(tpe, clazz)))
+            classAnnotPath = classAnnotPath.inType(TYPE_PATH_NESTED)
+            tpe = processClassType(processInner(TypeRef(tpe, clazz)), classAnnotPath)
           }
           accept(';')
           tpe
         case ARRAY_TAG =>
           while ('0' <= sig(index) && sig(index) <= '9') index += 1
-          var elemtp = sig2type(tparams, skiptvs)
+          var elemtp = sig2type(tparams, skiptvs, annotPath.inType(TYPE_PATH_ARRAY))
           // make unbounded Array[T] where T is a type variable into Array[T with Object]
           // (this is necessary because such arrays have a representation which is incompatible
           // with arrays of primitive types.
@@ -404,12 +502,14 @@ class ClassfileParser(
           // we need a method symbol. given in line 486 by calling getType(methodSym, ..)
           val paramtypes = new ListBuffer[Type]()
           var paramnames = new ListBuffer[TermName]()
+          var paramIndex = 0
           while (sig(index) != ')') {
             paramnames += nme.syntheticParamName(paramtypes.length)
-            paramtypes += objToAny(sig2type(tparams, skiptvs))
+            paramtypes += objToAny(sig2type(tparams, skiptvs, annotPath.inTarget(TARGET_METHOD_PARAM, paramIndex)))
+            paramIndex += 1
           }
           index += 1
-          val restype = sig2type(tparams, skiptvs)
+          val restype = sig2type(tparams, skiptvs, annotPath.inTarget(TARGET_RESULT))
           JavaMethodType(paramnames.toList, paramtypes.toList, restype)
         case 'T' =>
           val n = subName(';'.==).toTypeName
@@ -417,22 +517,28 @@ class ClassfileParser(
           //assert(tparams contains n, s"classTparams = $classTParams, tparams = $tparams, key = $n")
           if (skiptvs) defn.AnyType else tparams(n).typeRef
       }
+      if (tag == 'L')
+        tp // Class types are already annotated
+      else
+        AnnotatedType.make(tp, typeAnnots.annotations(annotPath))
     }
     // sig2type(tparams, skiptvs)
 
-    def sig2typeBounds(tparams: immutable.Map[Name, Symbol], skiptvs: Boolean)(implicit ctx: Context): Type = {
+    def sig2typeBounds(tparams: immutable.Map[Name, Symbol], skiptvs: Boolean, paramIndex: Int, owner: Symbol)(implicit ctx: Context): Type = {
       val ts = new ListBuffer[Type]
+      var boundIndex = 0
       while (sig(index) == ':') {
         index += 1
         if (sig(index) != ':') // guard against empty class bound
-          ts += objToAny(sig2type(tparams, skiptvs))
+          ts += objToAny(sig2type(tparams, skiptvs, annotPath.inTarget(if (owner.isTerm) TARGET_METHOD_BOUND else TARGET_CLASS_BOUND, paramIndex, boundIndex)))
+        boundIndex += 1
       }
       TypeBounds.upper(ts.foldLeft(NoType: Type)(_ & _) orElse defn.AnyType)
     }
 
     var tparams = classTParams
 
-    def typeParamCompleter(start: Int) = new LazyType {
+    def typeParamCompleter(start: Int, paramIndex: Int) = new LazyType {
       def complete(denot: SymDenotation)(implicit ctx: Context): Unit = {
         val savedIndex = index
         try {
@@ -440,7 +546,7 @@ class ClassfileParser(
           denot.info =
             checkNonCyclic( // we need the checkNonCyclic call to insert LazyRefs for F-bounded cycles
                 denot.symbol,
-                sig2typeBounds(tparams, skiptvs = false),
+                sig2typeBounds(tparams, skiptvs = false, paramIndex, denot.owner),
                 reportErrors = false)
         }
         finally
@@ -453,27 +559,35 @@ class ClassfileParser(
       assert(owner != null)
       index += 1
       val start = index
+      var paramIndex = 0
       while (sig(index) != '>') {
         val tpname = subName(':'.==).toTypeName
         val s = ctx.newSymbol(
           owner, tpname, owner.typeParamCreationFlags,
-          typeParamCompleter(index), coord = indexCoord(index))
+          typeParamCompleter(index, paramIndex), coord = indexCoord(index))
         if (owner.isClass) owner.asClass.enter(s)
+        val paramPath = annotPath.inTarget(if (owner.isTerm) TARGET_METHOD_TYPE_PARAM else TARGET_CLASS_TYPE_PARAM, paramIndex)
+        s.addAnnotations(typeAnnots.annotations(paramPath))
         tparams = tparams + (tpname -> s)
-        sig2typeBounds(tparams, skiptvs = true)
+        sig2typeBounds(tparams, skiptvs = true, paramIndex, owner)
         newTParams += s
+        paramIndex += 1
       }
       index += 1
     }
     val ownTypeParams = newTParams.toList.asInstanceOf[List[TypeSymbol]]
     val tpe =
       if ((owner == null) || !owner.isClass)
-        sig2type(tparams, skiptvs = false)
+        sig2type(tparams, skiptvs = false, annotPath)
       else {
         classTParams = tparams
         val parents = new ListBuffer[Type]()
-        while (index < end)
-          parents += sig2type(tparams, skiptvs = false)  // here the variance doesn't matter
+        var parentIndex = 0
+        while (index < end) {
+          val parentAnnotPath = annotPath.inTarget(TARGET_PARENT, if(parentIndex == 0) 65535 else parentIndex - 1)
+          parents += sig2type(tparams, skiptvs = false, parentAnnotPath)  // here the variance doesnt'matter
+          parentIndex += 1
+        }
         TempClassInfoType(parents.toList, instanceScope, owner)
       }
     if (ownTypeParams.isEmpty) tpe else TempPolyType(ownTypeParams, tpe)
@@ -491,9 +605,9 @@ class ClassfileParser(
       case INT_TAG | LONG_TAG | FLOAT_TAG | DOUBLE_TAG =>
         if (skip) None else Some(Literal(pool.getConstant(index)))
       case CLASS_TAG =>
-        if (skip) None else Some(Literal(Constant(pool.getType(index))))
+        if (skip) None else Some(Literal(Constant(pool.getType(index, TypeAnnotations.empty))))
       case ENUM_TAG =>
-        val t = pool.getType(index)
+        val t = pool.getType(index, TypeAnnotations.empty)
         val n = pool.getName(in.nextChar)
         val module = t.typeSymbol.companionModule
         val s = module.info.decls.lookup(n)
@@ -531,7 +645,7 @@ class ClassfileParser(
    *  return None.
    */
   def parseAnnotation(attrNameIndex: Char, skip: Boolean = false)(implicit ctx: Context): Option[Annotation] = try {
-    val attrType = pool.getType(attrNameIndex)
+    val attrType = pool.getType(attrNameIndex, TypeAnnotations.empty)
     val nargs = in.nextChar
     val argbuf = new ListBuffer[Tree]
     var hasError = false
@@ -560,13 +674,15 @@ class ClassfileParser(
       None // ignore malformed annotations
   }
 
-  def parseAttributes(sym: Symbol, symtype: Type)(implicit ctx: Context): Type = {
+  def parseAttributes(sym: Symbol, symtype: Type, parseTypeWithAnnots: TypeAnnotations => Type)(implicit ctx: Context): Type = {
     def convertTo(c: Constant, pt: Type): Constant =
       if (pt == defn.BooleanType && c.tag == IntTag)
         Constant(c.value != 0)
       else
         c convertTo pt
     var newType = symtype
+    var newSig: SimpleName = null
+    val typeAnnotBuffer: TypeAnnotationsBuffer = new TypeAnnotationsBuffer
 
     def parseAttribute(): Unit = {
       val attrName = pool.getName(in.nextChar).toTypeName
@@ -575,9 +691,7 @@ class ClassfileParser(
       attrName match {
         case tpnme.SignatureATTR =>
           val sig = pool.getExternalName(in.nextChar)
-          newType = sigToType(sig, sym)
-          if (ctx.debug && ctx.verbose)
-            println("" + sym + "; signature = " + sig + " type = " + newType)
+          newSig = sig
         case tpnme.SyntheticATTR =>
           sym.setFlag(Flags.SyntheticArtifact)
         case tpnme.BridgeATTR =>
@@ -597,6 +711,10 @@ class ClassfileParser(
         case tpnme.RuntimeVisibleAnnotationATTR
           | tpnme.RuntimeInvisibleAnnotationATTR =>
           parseAnnotations(attrLen)
+        // TODO: method parameter annotations are not parsed, because there are no method parameter symbols
+        case tpnme.RuntimeVisibleTypeAnnotationATTR
+          | tpnme.RuntimeInvisibleTypeAnnotationATTR =>
+          parseTypeAnnotations(attrLen)
 
         // TODO 1: parse runtime visible annotations on parameters
         // case tpnme.RuntimeParamAnnotationATTR
@@ -645,9 +763,61 @@ class ClassfileParser(
         }
     }
 
+    def parseTypeAnnotationTypePath(root: AnnotationPath): AnnotationPath = {
+      var pathLength = in.nextByte
+      var path = root.revPath
+      for(i <- 0.until(pathLength)) {
+        var pathElement = (in.nextByte.toInt, in.nextByte.toInt)
+        path = pathElement :: path
+      }
+      root.withRevPath(path)
+    }
+    def parseTypeAnnotationTargetPath(root: AnnotationPath): AnnotationPath = {
+      val targetType = in.nextByte
+      val targetPath = targetType match{
+        case TARGET_CLASS_TYPE_PARAM | TARGET_METHOD_TYPE_PARAM | TARGET_METHOD_PARAM =>
+          root.inTarget(targetType, in.nextByte)
+        case TARGET_PARENT | TARGET_THROWS =>
+          root.inTarget(targetType, in.nextChar)
+        case TARGET_FIELD | TARGET_RESULT | TARGET_RECEIVER =>
+          root.inTarget(targetType)
+        case TARGET_CLASS_BOUND | TARGET_METHOD_BOUND =>
+          root.inTarget(targetType, in.nextByte, in.nextByte)
+      }
+      parseTypeAnnotationTypePath(targetPath)
+    }
+
+    /** Parses a single type annotation and adds it to typeAnnots */
+    def parseTypeAnnotation(): Unit = {
+      val path = parseTypeAnnotationTargetPath(TypeAnnotations.root)
+      parseAnnotation(in.nextChar) match {
+        case Some(annot) =>
+          typeAnnotBuffer.add (path, annot)
+        case _ =>
+      }
+    }
+
+    /** Parses all type annotations in the attribute */
+    def parseTypeAnnotations(len: Int): Unit = {
+      val nAttr = in.nextChar
+      for (n <- 0 until nAttr)
+        parseTypeAnnotation()
+    }
+
     // begin parseAttributes
     for (i <- 0 until in.nextChar)
       parseAttribute()
+
+    val typeAnnots = typeAnnotBuffer.build
+
+    if (newSig ne null) {
+      newType = sigToType(newSig, typeAnnots, sym)
+      if (ctx.debug && ctx.verbose)
+        println("" + sym + "; signature = " + newSig + " type = " + newType)
+    }
+    else if (!typeAnnots.isEmpty) {
+      newType = parseTypeWithAnnots(typeAnnots)
+    }
 
     cook.apply(newType)
   }
@@ -843,7 +1013,7 @@ class ClassfileParser(
         val nAnnots = in.nextChar
         var i = 0
         while (i < nAnnots) {
-          val attrClass = pool.getType(in.nextChar).typeSymbol
+          val attrClass = pool.getType(in.nextChar, TypeAnnotations.empty).typeSymbol
           val nArgs = in.nextChar
           var j = 0
           while (j < nArgs) {
@@ -1079,7 +1249,7 @@ class ClassfileParser(
         if (in.buf(start).toInt != CONSTANT_CLASS) errorBadTag(start)
         val name = getExternalName(in.getChar(start + 1))
         if (name.firstPart(0) == ARRAY_TAG) {
-          c = sigToType(name)
+          c = sigToType(name, TypeAnnotations.empty)
           values(index) = c
         }
         else {
@@ -1095,8 +1265,8 @@ class ClassfileParser(
       c
     }
 
-    def getType(index: Int)(implicit ctx: Context): Type =
-      sigToType(getExternalName(index))
+    def getType(index: Int, typeAnnots: TypeAnnotations)(implicit ctx: Context): Type =
+      sigToType(getExternalName(index), typeAnnots)
 
     def getSuperClass(index: Int)(implicit ctx: Context): Symbol = {
       assert(index != 0, "attempt to parse java.lang.Object from classfile")

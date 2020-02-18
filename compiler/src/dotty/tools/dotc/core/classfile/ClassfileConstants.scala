@@ -331,6 +331,24 @@ object ClassfileConstants {
   final val impdep1       = 0xfe
   final val impdep2       = 0xff
 
+  // Target types of type annotations
+  val TARGET_CLASS_TYPE_PARAM  = 0x00
+  val TARGET_METHOD_TYPE_PARAM = 0x01
+  val TARGET_PARENT            = 0x10
+  val TARGET_CLASS_BOUND       = 0x11
+  val TARGET_METHOD_BOUND      = 0x12
+  val TARGET_FIELD             = 0x13
+  val TARGET_RESULT            = 0x14
+  val TARGET_RECEIVER          = 0x15
+  val TARGET_METHOD_PARAM      = 0x16
+  val TARGET_THROWS            = 0x17
+
+  // Kinds of type path
+  val TYPE_PATH_ARRAY          = 0x00
+  val TYPE_PATH_NESTED         = 0x01
+  val TYPE_PATH_BOUND          = 0x02
+  val TYPE_PATH_ARGUMENT       = 0x03
+
   import Flags._
   abstract class FlagTranslation {
 
